@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/argoproj/gitops-engine/pkg/diff/testdata"
+	"github.com/argoproj/gitops-engine/pkg/utils/kube/scheme"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
@@ -547,6 +549,17 @@ func TestRemoveNamespaceAnnotation(t *testing.T) {
 	}})
 	assert.Equal(t, "", obj.GetNamespace())
 	assert.Nil(t, obj.GetAnnotations())
+
+	obj = removeNamespaceAnnotation(&unstructured.Unstructured{Object: map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"name":        "test",
+			"namespace":   "default",
+			"annotations": "wrong value",
+		},
+	}})
+	assert.Equal(t, "", obj.GetNamespace())
+	val, _, _ := unstructured.NestedString(obj.Object, "metadata", "annotations")
+	assert.Equal(t, "wrong value", val)
 }
 
 const customObjConfig = `
@@ -734,6 +747,81 @@ func TestUnsortedEndpoints(t *testing.T) {
 	}
 }
 
+func TestStructuredMergeDiff(t *testing.T) {
+	parser := scheme.StaticParser()
+	svcParseType := parser.Type("io.k8s.api.core.v1.Service")
+	manager := "argocd-controller"
+
+	t.Run("will apply default values", func(t *testing.T) {
+		// given
+		liveState := StrToUnstructured(testdata.ServiceLiveYAML)
+		desiredState := StrToUnstructured(testdata.ServiceConfigYAML)
+
+		// when
+		result, err := structuredMergeDiff(desiredState, liveState, &svcParseType, manager)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.False(t, result.Modified)
+		predictedSVC := YamlToSvc(t, result.PredictedLive)
+		liveSVC := YamlToSvc(t, result.NormalizedLive)
+		assert.NotNil(t, predictedSVC.Spec.InternalTrafficPolicy)
+		assert.NotNil(t, liveSVC.Spec.InternalTrafficPolicy)
+		assert.Equal(t, "Cluster", string(*predictedSVC.Spec.InternalTrafficPolicy))
+		assert.Equal(t, "Cluster", string(*liveSVC.Spec.InternalTrafficPolicy))
+	})
+	t.Run("will remove entries in list", func(t *testing.T) {
+		// given
+		liveState := StrToUnstructured(testdata.ServiceLiveYAML)
+		desiredState := StrToUnstructured(testdata.ServiceConfigWith2Ports)
+		expectedLiveState := StrToUnstructured(testdata.ExpectedServiceLiveWith2PortsYAML)
+		expectedLiveBytes, err := json.Marshal(expectedLiveState)
+		require.NoError(t, err)
+
+		// when
+		result, err := structuredMergeDiff(desiredState, liveState, &svcParseType, manager)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.True(t, result.Modified)
+		assert.Equal(t, string(expectedLiveBytes), string(result.PredictedLive))
+	})
+	t.Run("will remove previously added fields not present in desired state", func(t *testing.T) {
+		// given
+		liveState := StrToUnstructured(testdata.LiveServiceWithTypeYAML)
+		desiredState := StrToUnstructured(testdata.ServiceConfigYAML)
+		expectedLiveState := StrToUnstructured(testdata.ServiceLiveNoTypeYAML)
+		expectedLiveBytes, err := json.Marshal(expectedLiveState)
+		require.NoError(t, err)
+
+		// when
+		result, err := structuredMergeDiff(desiredState, liveState, &svcParseType, manager)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.True(t, result.Modified)
+		assert.Equal(t, string(expectedLiveBytes), string(result.PredictedLive))
+	})
+	t.Run("will apply service with multiple ports", func(t *testing.T) {
+		// given
+		liveState := StrToUnstructured(testdata.ServiceLiveYAML)
+		desiredState := StrToUnstructured(testdata.ServiceConfigWithSamePortsYAML)
+
+		// when
+		result, err := structuredMergeDiff(desiredState, liveState, &svcParseType, manager)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.True(t, result.Modified)
+		svc := YamlToSvc(t, result.PredictedLive)
+		assert.Equal(t, 5, len(svc.Spec.Ports))
+	})
+}
+
 func createSecret(data map[string]string) *unstructured.Unstructured {
 	secret := corev1.Secret{TypeMeta: metav1.TypeMeta{Kind: "Secret"}}
 	if data != nil {
@@ -785,6 +873,81 @@ func TestHideSecretDataDifferentKeysDifferentValues(t *testing.T) {
 
 	assert.Equal(t, map[string]interface{}{"key1": replacement1, "key2": replacement1}, secretData(target))
 	assert.Equal(t, map[string]interface{}{"key2": replacement2, "key3": replacement1}, secretData(live))
+}
+
+func getTargetSecretJsonBytes() []byte {
+	return []byte(`
+{
+    "apiVersion": "v1",
+    "kind": "Secret",
+    "type": "kubernetes.io/service-account-token",
+    "metadata": {
+        "annotations": {
+            "kubernetes.io/service-account.name": "default"
+        },
+        "labels": {
+            "app.kubernetes.io/instance": "empty-secret"
+        },
+        "name": "an-empty-secret",
+        "namespace": "default"
+    },
+	"data": {}
+}`)
+}
+
+func getLiveSecretJsonBytes() []byte {
+	return []byte(`
+{
+    "kind": "Secret",
+    "apiVersion": "v1",
+    "type": "kubernetes.io/service-account-token",
+    "metadata": {
+        "annotations": {
+            "kubernetes.io/service-account.name": "default",
+            "kubernetes.io/service-account.uid": "78688180-d432-4ee8-939d-382b015a6b13"
+        },
+        "creationTimestamp": "2021-10-27T19:09:22Z",
+        "labels": {
+            "app.kubernetes.io/instance": "empty-secret"
+        },
+        "name": "an-empty-secret",
+        "namespace": "default",
+        "resourceVersion": "2329692",
+        "uid": "2e98590d-a699-4281-89d5-aa94dfc1d7d7"
+    },
+    "data": {
+        "namespace": "ZGVmYXVsdA==",
+        "token": "ZGVmYXVsdAcb=="
+    }
+}`)
+}
+
+func bytesToUnstructured(t *testing.T, jsonBytes []byte) *unstructured.Unstructured {
+	t.Helper()
+	var jsonMap map[string]interface{}
+	err := json.Unmarshal(jsonBytes, &jsonMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &unstructured.Unstructured{
+		Object: jsonMap,
+	}
+}
+
+func TestHideSecretDataHandleEmptySecret(t *testing.T) {
+	// given
+	targetSecret := bytesToUnstructured(t, getTargetSecretJsonBytes())
+	liveSecret := bytesToUnstructured(t, getLiveSecretJsonBytes())
+
+	// when
+	target, live, err := HideSecretData(targetSecret, liveSecret)
+
+	// then
+	assert.NoError(t, err)
+	assert.NotNil(t, target)
+	assert.NotNil(t, live)
+	assert.Equal(t, nil, target.Object["data"])
+	assert.Equal(t, map[string]interface{}{"namespace": "++++++++", "token": "++++++++"}, secretData(live))
 }
 
 func TestHideSecretDataLastAppliedConfig(t *testing.T) {
@@ -905,4 +1068,23 @@ func diffOptionsForTest() []Option {
 		WithLogr(klogr.New()),
 		IgnoreAggregatedRoles(false),
 	}
+}
+
+func YamlToSvc(t *testing.T, y []byte) *corev1.Service {
+	t.Helper()
+	svc := corev1.Service{}
+	err := yaml.Unmarshal(y, &svc)
+	if err != nil {
+		t.Fatalf("error unmarshaling service bytes: %s", err)
+	}
+	return &svc
+}
+
+func StrToUnstructured(yamlStr string) *unstructured.Unstructured {
+	obj := make(map[string]interface{})
+	err := yaml.Unmarshal([]byte(yamlStr), &obj)
+	if err != nil {
+		panic(err)
+	}
+	return &unstructured.Unstructured{Object: obj}
 }

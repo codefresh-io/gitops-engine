@@ -20,36 +20,44 @@ var syncPhaseOrder = map[common.SyncPhase]int{
 }
 
 // kindOrder represents the correct order of Kubernetes resources within a manifest
-// https://github.com/helm/helm/blob/master/pkg/tiller/kind_sorter.go
+// https://github.com/helm/helm/blob/0361dc85689e3a6d802c444e2540c92cb5842bc9/pkg/releaseutil/kind_sorter.go
 var kindOrder = map[string]int{}
 
 func init() {
 	kinds := []string{
 		"Namespace",
+		"NetworkPolicy",
 		"ResourceQuota",
 		"LimitRange",
 		"PodSecurityPolicy",
 		"PodDisruptionBudget",
+		"ServiceAccount",
 		"Secret",
+		"SecretList",
 		"ConfigMap",
 		"StorageClass",
 		"PersistentVolume",
 		"PersistentVolumeClaim",
-		"ServiceAccount",
 		"CustomResourceDefinition",
 		"ClusterRole",
+		"ClusterRoleList",
 		"ClusterRoleBinding",
+		"ClusterRoleBindingList",
 		"Role",
+		"RoleList",
 		"RoleBinding",
+		"RoleBindingList",
 		"Service",
 		"DaemonSet",
 		"Pod",
 		"ReplicationController",
 		"ReplicaSet",
 		"Deployment",
+		"HorizontalPodAutoscaler",
 		"StatefulSet",
 		"Job",
 		"CronJob",
+		"IngressClass",
 		"Ingress",
 		"APIService",
 	}
@@ -187,6 +195,18 @@ func (s syncTasks) Split(predicate func(task *syncTask) bool) (trueTasks, falseT
 		}
 	}
 	return trueTasks, falseTasks
+}
+
+func (s syncTasks) Map(predicate func(task *syncTask) string) []string {
+	messagesMap := make(map[string]interface{})
+	for _, task := range s {
+		messagesMap[predicate(task)] = nil
+	}
+	messages := make([]string, 0)
+	for key := range messagesMap {
+		messages = append(messages, key)
+	}
+	return messages
 }
 
 func (s syncTasks) All(predicate func(task *syncTask) bool) bool {

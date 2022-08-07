@@ -28,21 +28,23 @@ import (
 	testingutils "github.com/argoproj/gitops-engine/pkg/utils/testing"
 )
 
+var standardVerbs = v1.Verbs{"create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"}
+
 func newTestSyncCtx(opts ...SyncOpt) *syncContext {
 	fakeDisco := &fakedisco.FakeDiscovery{Fake: &testcore.Fake{}}
 	fakeDisco.Resources = append(make([]*v1.APIResourceList, 0),
 		&v1.APIResourceList{
 			GroupVersion: "v1",
 			APIResources: []v1.APIResource{
-				{Kind: "Pod", Group: "", Version: "v1", Namespaced: true},
-				{Kind: "Service", Group: "", Version: "v1", Namespaced: true},
-				{Kind: "Namespace", Group: "", Version: "v1", Namespaced: false},
+				{Kind: "Pod", Group: "", Version: "v1", Namespaced: true, Verbs: standardVerbs},
+				{Kind: "Service", Group: "", Version: "v1", Namespaced: true, Verbs: standardVerbs},
+				{Kind: "Namespace", Group: "", Version: "v1", Namespaced: false, Verbs: standardVerbs},
 			},
 		},
 		&v1.APIResourceList{
 			GroupVersion: "apps/v1",
 			APIResources: []v1.APIResource{
-				{Kind: "Deployment", Group: "apps", Version: "v1", Namespaced: true},
+				{Kind: "Deployment", Group: "apps", Version: "v1", Namespaced: true, Verbs: standardVerbs},
 			},
 		})
 	sc := syncContext{
@@ -161,7 +163,7 @@ func TestSyncCustomResources(t *testing.T) {
 
 			knownCustomResourceTypes := []v1.APIResource{}
 			if tt.fields.crdAlreadyPresent {
-				knownCustomResourceTypes = append(knownCustomResourceTypes, v1.APIResource{Kind: "TestCrd", Group: "argoproj.io", Version: "v1", Namespaced: true})
+				knownCustomResourceTypes = append(knownCustomResourceTypes, v1.APIResource{Kind: "TestCrd", Group: "argoproj.io", Version: "v1", Namespaced: true, Verbs: standardVerbs})
 			}
 
 			syncCtx := newTestSyncCtx()
@@ -173,7 +175,7 @@ func TestSyncCustomResources(t *testing.T) {
 				{
 					GroupVersion: "apiextensions.k8s.io/v1beta1",
 					APIResources: []v1.APIResource{
-						{Kind: "CustomResourceDefinition", Group: "apiextensions.k8s.io", Version: "v1beta1", Namespaced: true},
+						{Kind: "CustomResourceDefinition", Group: "apiextensions.k8s.io", Version: "v1beta1", Namespaced: true, Verbs: standardVerbs},
 					},
 				},
 			}
@@ -455,13 +457,13 @@ func TestSyncPruneFailure(t *testing.T) {
 	assert.Equal(t, "foo", result.Message)
 }
 
-func TestDontSyncOrPruneHooks(t *testing.T) {
+func TestDoNotSyncOrPruneHooks(t *testing.T) {
 	syncCtx := newTestSyncCtx(WithOperationSettings(false, false, false, true))
 	targetPod := NewPod()
-	targetPod.SetName("dont-create-me")
+	targetPod.SetName("do-not-create-me")
 	targetPod.SetAnnotations(map[string]string{synccommon.AnnotationKeyHook: "PreSync"})
 	liveSvc := NewService()
-	liveSvc.SetName("dont-prune-me")
+	liveSvc.SetName("do-not-prune-me")
 	liveSvc.SetNamespace(FakeArgoCDNamespace)
 	liveSvc.SetAnnotations(map[string]string{synccommon.AnnotationKeyHook: "PreSync"})
 
@@ -473,7 +475,7 @@ func TestDontSyncOrPruneHooks(t *testing.T) {
 }
 
 // make sure that we do not prune resources with Prune=false
-func TestDontPrunePruneFalse(t *testing.T) {
+func TestDoNotPrunePruneFalse(t *testing.T) {
 	syncCtx := newTestSyncCtx(WithOperationSettings(false, true, false, false))
 	pod := NewPod()
 	pod.SetAnnotations(map[string]string{synccommon.AnnotationSyncOptions: "Prune=false"})
@@ -561,6 +563,57 @@ func TestSync_Replace(t *testing.T) {
 
 			kubectl, _ := syncCtx.kubectl.(*kubetest.MockKubectlCmd)
 			assert.Equal(t, tc.commandUsed, kubectl.GetLastResourceCommand(kube.GetResourceKey(tc.target)))
+		})
+	}
+}
+
+func withServerSideApplyAnnotation(un *unstructured.Unstructured) *unstructured.Unstructured {
+	un.SetAnnotations(map[string]string{synccommon.AnnotationSyncOptions: synccommon.SyncOptionServerSideApply})
+	return un
+}
+
+func withReplaceAndServerSideApplyAnnotations(un *unstructured.Unstructured) *unstructured.Unstructured {
+	un.SetAnnotations(map[string]string{synccommon.AnnotationSyncOptions: "Replace=true,ServerSideApply=true"})
+	return un
+}
+
+func TestSync_ServerSideApply(t *testing.T) {
+	testCases := []struct {
+		name            string
+		target          *unstructured.Unstructured
+		live            *unstructured.Unstructured
+		commandUsed     string
+		serverSideApply bool
+		manager         string
+	}{
+		{"NoAnnotation", NewPod(), NewPod(), "apply", false, "managerA"},
+		{"ServerSideApplyAnnotationIsSet", withServerSideApplyAnnotation(NewPod()), NewPod(), "apply", true, "managerB"},
+		{"ServerSideApplyAndReplaceAnnotationsAreSet", withReplaceAndServerSideApplyAnnotations(NewPod()), NewPod(), "replace", false, ""},
+		{"LiveObjectMissing", withReplaceAnnotation(NewPod()), nil, "create", false, ""},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			syncCtx := newTestSyncCtx()
+			syncCtx.serverSideApplyManager = tc.manager
+
+			tc.target.SetNamespace(FakeArgoCDNamespace)
+			if tc.live != nil {
+				tc.live.SetNamespace(FakeArgoCDNamespace)
+			}
+			syncCtx.resources = groupResources(ReconciliationResult{
+				Live:   []*unstructured.Unstructured{tc.live},
+				Target: []*unstructured.Unstructured{tc.target},
+			})
+
+			syncCtx.Sync()
+
+			kubectl, _ := syncCtx.kubectl.(*kubetest.MockKubectlCmd)
+			assert.Equal(t, tc.commandUsed, kubectl.GetLastResourceCommand(kube.GetResourceKey(tc.target)))
+			assert.Equal(t, tc.serverSideApply, kubectl.GetLastServerSideApply())
+			assert.Equal(t, tc.manager, kubectl.GetLastServerSideApplyManager())
 		})
 	}
 }
@@ -1204,7 +1257,7 @@ func TestPruneLast(t *testing.T) {
 		assert.Equal(t, 3, tasks.lastWave())
 	})
 
-	t.Run("pruneLastIndidualResources", func(t *testing.T) {
+	t.Run("pruneLastIndividualResources", func(t *testing.T) {
 		syncCtx.pruneLast = false
 
 		pod1.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "2"})
@@ -1265,4 +1318,41 @@ func TestSyncContext_GetDeleteOptions_WithPrunePropagationPolicy(t *testing.T) {
 
 	opts := sc.getDeleteOptions()
 	assert.Equal(t, v1.DeletePropagationBackground, *opts.PropagationPolicy)
+}
+
+func TestSetOperationFailed(t *testing.T) {
+	sc := syncContext{}
+	sc.log = klogr.New().WithValues("application", "fake-app")
+
+	tasks := make([]*syncTask, 0)
+	tasks = append(tasks, &syncTask{message: "namespace not found"})
+
+	sc.setOperationFailed(nil, tasks, "one or more objects failed to apply")
+
+	assert.Equal(t, sc.message, "one or more objects failed to apply, reason: namespace not found")
+
+}
+
+func TestSetOperationFailedDuplicatedMessages(t *testing.T) {
+	sc := syncContext{}
+	sc.log = klogr.New().WithValues("application", "fake-app")
+
+	tasks := make([]*syncTask, 0)
+	tasks = append(tasks, &syncTask{message: "namespace not found"})
+	tasks = append(tasks, &syncTask{message: "namespace not found"})
+
+	sc.setOperationFailed(nil, tasks, "one or more objects failed to apply")
+
+	assert.Equal(t, sc.message, "one or more objects failed to apply, reason: namespace not found")
+
+}
+
+func TestSetOperationFailedNoTasks(t *testing.T) {
+	sc := syncContext{}
+	sc.log = klogr.New().WithValues("application", "fake-app")
+
+	sc.setOperationFailed(nil, nil, "one or more objects failed to apply")
+
+	assert.Equal(t, sc.message, "one or more objects failed to apply")
+
 }

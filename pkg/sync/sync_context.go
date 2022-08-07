@@ -12,7 +12,7 @@ import (
 
 	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	v1extensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	apierr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -179,6 +179,18 @@ func WithReplace(replace bool) SyncOpt {
 	}
 }
 
+func WithServerSideApply(serverSideApply bool) SyncOpt {
+	return func(ctx *syncContext) {
+		ctx.serverSideApply = serverSideApply
+	}
+}
+
+func WithServerSideApplyManager(manager string) SyncOpt {
+	return func(ctx *syncContext) {
+		ctx.serverSideApplyManager = manager
+	}
+}
+
 // NewSyncContext creates new instance of a SyncContext
 func NewSyncContext(
 	revision string,
@@ -320,6 +332,8 @@ type syncContext struct {
 	resourcesFilter        func(key kube.ResourceKey, target *unstructured.Unstructured, live *unstructured.Unstructured) bool
 	prune                  bool
 	replace                bool
+	serverSideApply        bool
+	serverSideApplyManager string
 	pruneLast              bool
 	prunePropagationPolicy *metav1.DeletionPropagation
 
@@ -450,10 +464,12 @@ func (sc *syncContext) Sync() {
 	// syncFailTasks only run during failure, so separate them from regular tasks
 	syncFailTasks, tasks := tasks.Split(func(t *syncTask) bool { return t.phase == common.SyncPhaseSyncFail })
 
+	syncFailedTasks, _ := tasks.Split(func(t *syncTask) bool { return t.syncStatus == common.ResultCodeSyncFailed })
+
 	// if there are any completed but unsuccessful tasks, sync is a failure.
 	if tasks.Any(func(t *syncTask) bool { return t.completed() && !t.successful() }) {
 		sc.deleteHooks(hooksPendingDeletionFailed)
-		sc.setOperationFailed(syncFailTasks, "one or more synchronization tasks completed unsuccessfully")
+		sc.setOperationFailed(syncFailTasks, syncFailedTasks, "one or more synchronization tasks completed unsuccessfully")
 		return
 	}
 
@@ -504,8 +520,9 @@ func (sc *syncContext) Sync() {
 
 	switch runState {
 	case failed:
+		syncFailedTasks, _ := tasks.Split(func(t *syncTask) bool { return t.syncStatus == common.ResultCodeSyncFailed })
 		sc.deleteHooks(hooksPendingDeletionFailed)
-		sc.setOperationFailed(syncFailTasks, "one or more objects failed to apply")
+		sc.setOperationFailed(syncFailTasks, syncFailedTasks, "one or more objects failed to apply")
 	case successful:
 		if remainingTasks.Len() == 0 {
 			// delete all completed hooks which have appropriate delete policy
@@ -556,21 +573,33 @@ func (sc *syncContext) GetState() (common.OperationPhase, string, []common.Resou
 	return sc.phase, sc.message, resourceRes
 }
 
-func (sc *syncContext) setOperationFailed(syncFailTasks syncTasks, message string) {
+func (sc *syncContext) setOperationFailed(syncFailTasks, syncFailedTasks syncTasks, message string) {
+	errorMessageFactory := func(tasks []*syncTask, message string) string {
+		messages := syncFailedTasks.Map(func(task *syncTask) string {
+			return task.message
+		})
+		if len(messages) > 0 {
+			return fmt.Sprintf("%s, reason: %s", message, strings.Join(messages, ","))
+		}
+		return message
+	}
+
+	errorMessage := errorMessageFactory(syncFailedTasks, message)
+
 	if len(syncFailTasks) > 0 {
 		// if all the failure hooks are completed, don't run them again, and mark the sync as failed
 		if syncFailTasks.All(func(task *syncTask) bool { return task.completed() }) {
-			sc.setOperationPhase(common.OperationFailed, message)
+			sc.setOperationPhase(common.OperationFailed, errorMessage)
 			return
 		}
 		// otherwise, we need to start the failure hooks, and then return without setting
 		// the phase, so we make sure we have at least one more sync
 		sc.log.WithValues("syncFailTasks", syncFailTasks).V(1).Info("Running sync fail tasks")
 		if sc.runTasks(syncFailTasks, false) == failed {
-			sc.setOperationPhase(common.OperationFailed, message)
+			sc.setOperationPhase(common.OperationFailed, errorMessage)
 		}
 	} else {
-		sc.setOperationPhase(common.OperationFailed, message)
+		sc.setOperationPhase(common.OperationFailed, errorMessage)
 	}
 }
 
@@ -579,7 +608,7 @@ func (sc *syncContext) started() bool {
 }
 
 func (sc *syncContext) containsResource(resource reconciledResource) bool {
-	return sc.resourcesFilter == nil || sc.resourcesFilter(resource.key(), resource.Live, resource.Target)
+	return sc.resourcesFilter == nil || sc.resourcesFilter(resource.key(), resource.Target, resource.Live)
 }
 
 // generates the list of sync tasks we will be performing during this sync.
@@ -668,7 +697,7 @@ func (sc *syncContext) getSyncTasks() (_ syncTasks, successful bool) {
 
 	// check permissions
 	for _, task := range tasks {
-		serverRes, err := kube.ServerResourceForGroupVersionKind(sc.disco, task.groupVersionKind())
+		serverRes, err := kube.ServerResourceForGroupVersionKind(sc.disco, task.groupVersionKind(), "get")
 		if err != nil {
 			// Special case for custom resources: if CRD is not yet known by the K8s API server,
 			// and the CRD is part of this sync or the resource is annotated with SkipDryRunOnMissingResource=true,
@@ -816,23 +845,23 @@ func (sc *syncContext) setOperationPhase(phase common.OperationPhase, message st
 	sc.message = message
 }
 
-// ensureCRDReady waits until specified CRD is ready (established condition is true). Method is best effort - it does not fail even if CRD is not ready without timeout.
-func (sc *syncContext) ensureCRDReady(name string) {
-	_ = wait.PollImmediate(time.Duration(100)*time.Millisecond, crdReadinessTimeout, func() (bool, error) {
-		crd, err := sc.extensionsclientset.ApiextensionsV1beta1().CustomResourceDefinitions().Get(context.TODO(), name, metav1.GetOptions{})
+// ensureCRDReady waits until specified CRD is ready (established condition is true).
+func (sc *syncContext) ensureCRDReady(name string) error {
+	return wait.PollImmediate(time.Duration(100)*time.Millisecond, crdReadinessTimeout, func() (bool, error) {
+		crd, err := sc.extensionsclientset.ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
 		for _, condition := range crd.Status.Conditions {
-			if condition.Type == v1beta1.Established {
-				return condition.Status == v1beta1.ConditionTrue, nil
+			if condition.Type == v1extensions.Established {
+				return condition.Status == v1extensions.ConditionTrue, nil
 			}
 		}
 		return false, nil
 	})
 }
 
-func (sc *syncContext) applyObject(t *syncTask, dryRun bool, force bool, validate bool) (common.ResultCode, string) {
+func (sc *syncContext) applyObject(t *syncTask, dryRun, force, validate bool) (common.ResultCode, string) {
 	dryRunStrategy := cmdutil.DryRunNone
 	if dryRun {
 		dryRunStrategy = cmdutil.DryRunClient
@@ -841,6 +870,7 @@ func (sc *syncContext) applyObject(t *syncTask, dryRun bool, force bool, validat
 	var err error
 	var message string
 	shouldReplace := sc.replace || resourceutil.HasAnnotationOption(t.targetObj, common.AnnotationSyncOptions, common.SyncOptionReplace)
+	serverSideApply := sc.serverSideApply || resourceutil.HasAnnotationOption(t.targetObj, common.AnnotationSyncOptions, common.SyncOptionServerSideApply)
 	if shouldReplace {
 		if t.liveObj != nil {
 			// Avoid using `kubectl replace` for CRDs since 'replace' might recreate resource and so delete all CRD instances
@@ -860,13 +890,16 @@ func (sc *syncContext) applyObject(t *syncTask, dryRun bool, force bool, validat
 			message, err = sc.resourceOps.CreateResource(context.TODO(), t.targetObj, dryRunStrategy, validate)
 		}
 	} else {
-		message, err = sc.resourceOps.ApplyResource(context.TODO(), t.targetObj, dryRunStrategy, force, validate)
+		message, err = sc.resourceOps.ApplyResource(context.TODO(), t.targetObj, dryRunStrategy, force, validate, serverSideApply, sc.serverSideApplyManager)
 	}
 	if err != nil {
 		return common.ResultCodeSyncFailed, err.Error()
 	}
 	if kube.IsCRD(t.targetObj) && !dryRun {
-		sc.ensureCRDReady(t.targetObj.GetName())
+		crdName := t.targetObj.GetName()
+		if err = sc.ensureCRDReady(crdName); err != nil {
+			sc.log.Error(err, fmt.Sprintf("failed to ensure that CRD %s is ready", crdName))
+		}
 	}
 	return common.ResultCodeSynced, message
 }
@@ -974,15 +1007,15 @@ func (sc *syncContext) Terminate() {
 
 func (sc *syncContext) deleteResource(task *syncTask) error {
 	sc.log.WithValues("task", task).V(1).Info("Deleting resource")
-	resIf, err := sc.getResourceIf(task)
+	resIf, err := sc.getResourceIf(task, "delete")
 	if err != nil {
 		return err
 	}
 	return resIf.Delete(context.TODO(), task.name(), sc.getDeleteOptions())
 }
 
-func (sc *syncContext) getResourceIf(task *syncTask) (dynamic.ResourceInterface, error) {
-	apiResource, err := kube.ServerResourceForGroupVersionKind(sc.disco, task.groupVersionKind())
+func (sc *syncContext) getResourceIf(task *syncTask, verb string) (dynamic.ResourceInterface, error) {
+	apiResource, err := kube.ServerResourceForGroupVersionKind(sc.disco, task.groupVersionKind(), verb)
 	if err != nil {
 		return nil, err
 	}

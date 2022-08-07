@@ -1,7 +1,9 @@
 package cache
 
 import (
+	"context"
 	"fmt"
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	"sort"
 	"strings"
 	"testing"
@@ -107,10 +109,18 @@ func newCluster(t *testing.T, objs ...runtime.Object) *clusterCache {
 	return cache
 }
 
+func (c *clusterCache) WithAPIResources(newApiResources []kube.APIResourceInfo) *clusterCache {
+	apiResources := c.kubectl.(*kubetest.MockKubectlCmd).APIResources
+	apiResources = append(apiResources, newApiResources...)
+	c.kubectl.(*kubetest.MockKubectlCmd).APIResources = apiResources
+	return c
+}
+
 func getChildren(cluster *clusterCache, un *unstructured.Unstructured) []*Resource {
 	hierarchy := make([]*Resource, 0)
-	cluster.IterateHierarchy(kube.GetResourceKey(un), func(child *Resource, _ map[kube.ResourceKey]*Resource) {
+	cluster.IterateHierarchy(kube.GetResourceKey(un), func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
 		hierarchy = append(hierarchy, child)
+		return true
 	})
 	return hierarchy[1:]
 }
@@ -479,6 +489,88 @@ metadata:
 	assert.EqualError(t, err, "Namespace \"production\" for Deployment \"helm-guestbook\" is not managed")
 }
 
+func TestGetManagedLiveObjsFailedConversion(t *testing.T) {
+	cronTabGroup := "stable.example.com"
+
+	testCases := []struct{
+		name string
+		localConvertFails bool
+		expectConvertToVersionCalled bool
+		expectGetResourceCalled bool
+	}{
+		{
+			name: "local convert fails, so GetResource is called",
+			localConvertFails: true,
+			expectConvertToVersionCalled: true,
+			expectGetResourceCalled: true,
+		},
+		{
+			name: "local convert succeeds, so GetResource is not called",
+			localConvertFails: false,
+			expectConvertToVersionCalled: true,
+			expectGetResourceCalled: false,
+		},
+	}
+
+	for _, testCase := range testCases {
+		testCaseCopy := testCase
+		t.Run(testCaseCopy.name, func(t *testing.T) {
+			err := apiextensions.AddToScheme(scheme.Scheme)
+			require.NoError(t, err)
+			cluster := newCluster(t, testCRD(), testCronTab()).
+				WithAPIResources([]kube.APIResourceInfo{
+					{
+						GroupKind:            schema.GroupKind{Group: cronTabGroup, Kind: "CronTab"},
+						GroupVersionResource: schema.GroupVersionResource{Group: cronTabGroup, Version: "v1", Resource: "crontabs"},
+						Meta:                 metav1.APIResource{Namespaced: true},
+					},
+				})
+			cluster.Invalidate(SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
+				return nil, true
+			}))
+			cluster.namespaces = []string{"default"}
+
+			err = cluster.EnsureSynced()
+			require.NoError(t, err)
+
+			targetDeploy := strToUnstructured(`
+apiVersion: stable.example.com/v1
+kind: CronTab
+metadata:
+  name: test-crontab
+  namespace: default`)
+
+			var convertToVersionWasCalled = false
+			var getResourceWasCalled = false
+			cluster.kubectl.(*kubetest.MockKubectlCmd).
+				WithConvertToVersionFunc(func(obj *unstructured.Unstructured, _ string, _ string) (*unstructured.Unstructured, error) {
+					convertToVersionWasCalled = true
+
+					if testCaseCopy.localConvertFails {
+						return nil, fmt.Errorf("failed to convert resource client-side")
+					}
+
+					return obj, nil
+				}).
+				WithGetResourceFunc(func(_ context.Context, _ *rest.Config, _ schema.GroupVersionKind, _ string, _ string) (*unstructured.Unstructured, error) {
+					getResourceWasCalled = true
+					return testCronTab(), nil
+				})
+
+
+			managedObjs, err := cluster.GetManagedLiveObjs([]*unstructured.Unstructured{targetDeploy}, func(r *Resource) bool {
+				return true
+			})
+			assert.NoError(t, err)
+			assert.Equal(t, testCaseCopy.expectConvertToVersionCalled, convertToVersionWasCalled)
+			assert.Equal(t, testCaseCopy.expectGetResourceCalled, getResourceWasCalled)
+			assert.Equal(t, managedObjs, map[kube.ResourceKey]*unstructured.Unstructured{
+				kube.NewResourceKey(cronTabGroup, "CronTab", "default", "test-crontab"): mustToUnstructured(testCronTab()),
+			})
+		})
+	}
+}
+
 func TestChildDeletedEvent(t *testing.T) {
 	cluster := newCluster(t, testPod(), testRS(), testDeploy())
 	err := cluster.EnsureSynced()
@@ -620,14 +712,52 @@ func TestGetDuplicatedChildren(t *testing.T) {
 
 func TestGetClusterInfo(t *testing.T) {
 	cluster := newCluster(t)
-	cluster.apiGroups = []metav1.APIGroup{{Name: "test"}}
+	cluster.apiResources = []kube.APIResourceInfo{{GroupKind: schema.GroupKind{Group: "test", Kind: "test kind"}}}
 	cluster.serverVersion = "v1.16"
 	info := cluster.GetClusterInfo()
 	assert.Equal(t, ClusterInfo{
-		Server:     cluster.config.Host,
-		APIGroups:  cluster.apiGroups,
-		K8SVersion: cluster.serverVersion,
+		Server:       cluster.config.Host,
+		APIResources: cluster.apiResources,
+		K8SVersion:   cluster.serverVersion,
 	}, info)
+}
+
+func TestDeleteAPIResource(t *testing.T) {
+	cluster := newCluster(t)
+	cluster.apiResources = []kube.APIResourceInfo{{
+		GroupKind:            schema.GroupKind{Group: "test", Kind: "test kind"},
+		GroupVersionResource: schema.GroupVersionResource{Version: "v1"},
+	}}
+
+	cluster.deleteAPIResource(kube.APIResourceInfo{GroupKind: schema.GroupKind{Group: "wrong group", Kind: "wrong kind"}})
+	assert.Len(t, cluster.apiResources, 1)
+	cluster.deleteAPIResource(kube.APIResourceInfo{
+		GroupKind:            schema.GroupKind{Group: "test", Kind: "test kind"},
+		GroupVersionResource: schema.GroupVersionResource{Version: "wrong version"},
+	})
+	assert.Len(t, cluster.apiResources, 1)
+
+	cluster.deleteAPIResource(kube.APIResourceInfo{
+		GroupKind:            schema.GroupKind{Group: "test", Kind: "test kind"},
+		GroupVersionResource: schema.GroupVersionResource{Version: "v1"},
+	})
+	assert.Empty(t, cluster.apiResources)
+}
+
+func TestAppendAPIResource(t *testing.T) {
+	cluster := newCluster(t)
+
+	resourceInfo := kube.APIResourceInfo{
+		GroupKind:            schema.GroupKind{Group: "test", Kind: "test kind"},
+		GroupVersionResource: schema.GroupVersionResource{Version: "v1"},
+	}
+
+	cluster.appendAPIResource(resourceInfo)
+	assert.ElementsMatch(t, []kube.APIResourceInfo{resourceInfo}, cluster.apiResources)
+
+	// make sure same group, kind version is not added twice
+	cluster.appendAPIResource(resourceInfo)
+	assert.ElementsMatch(t, []kube.APIResourceInfo{resourceInfo}, cluster.apiResources)
 }
 
 func ExampleNewClusterCache_resourceUpdatedEvents() {
@@ -682,6 +812,59 @@ func testPod() *corev1.Pod {
 			},
 		},
 	}
+}
+
+func testCRD() *apiextensions.CustomResourceDefinition {
+	return &apiextensions.CustomResourceDefinition{
+		TypeMeta:   metav1.TypeMeta{
+			APIVersion: "apiextensions.k8s.io/v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "crontabs.stable.example.com",
+		},
+		Spec:       apiextensions.CustomResourceDefinitionSpec{
+			Group: "stable.example.com",
+			Versions: []apiextensions.CustomResourceDefinitionVersion{
+				{
+					Name: "v1",
+					Served: true,
+					Storage: true,
+					Schema: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+							Type: "object",
+							Properties: map[string]apiextensions.JSONSchemaProps{
+								"cronSpec": {Type: "string"},
+								"image": {Type: "string"},
+								"replicas": {Type: "integer"},
+							},
+						},
+					},
+				},
+			},
+			Scope: "Namespaced",
+			Names: apiextensions.CustomResourceDefinitionNames{
+				Plural:     "crontabs",
+				Singular:   "crontab",
+				ShortNames: []string{"ct"},
+				Kind:       "CronTab",
+			},
+		},
+	}
+}
+
+func testCronTab() *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "stable.example.com/v1",
+		"kind": "CronTab",
+		"metadata": map[string]interface{}{
+			"name": "test-crontab",
+			"namespace": "default",
+		},
+		"spec": map[string]interface{}{
+			"cronSpec": "* * * * */5",
+			"image": "my-awesome-cron-image",
+		},
+	}}
 }
 
 func testExtensionsRS() *extensionsv1beta1.ReplicaSet {
@@ -757,4 +940,69 @@ func testDeploy() *appsv1.Deployment {
 			},
 		},
 	}
+}
+
+func TestIterateHierachy(t *testing.T) {
+	cluster := newCluster(t, testPod(), testRS(), testDeploy())
+	err := cluster.EnsureSynced()
+	require.NoError(t, err)
+
+	t.Run("IterateAll", func(t *testing.T) {
+		keys := []kube.ResourceKey{}
+		cluster.IterateHierarchy(kube.GetResourceKey(mustToUnstructured(testDeploy())), func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			keys = append(keys, child.ResourceKey())
+			return true
+		})
+
+		assert.ElementsMatch(t,
+			[]kube.ResourceKey{
+				kube.GetResourceKey(mustToUnstructured(testPod())),
+				kube.GetResourceKey(mustToUnstructured(testRS())),
+				kube.GetResourceKey(mustToUnstructured(testDeploy()))},
+			keys)
+	})
+
+	t.Run("ExitAtRoot", func(t *testing.T) {
+		keys := []kube.ResourceKey{}
+		cluster.IterateHierarchy(kube.GetResourceKey(mustToUnstructured(testDeploy())), func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			keys = append(keys, child.ResourceKey())
+			return false
+		})
+
+		assert.ElementsMatch(t,
+			[]kube.ResourceKey{
+				kube.GetResourceKey(mustToUnstructured(testDeploy()))},
+			keys)
+	})
+
+	t.Run("ExitAtSecondLevelChild", func(t *testing.T) {
+		keys := []kube.ResourceKey{}
+		cluster.IterateHierarchy(kube.GetResourceKey(mustToUnstructured(testDeploy())), func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			keys = append(keys, child.ResourceKey())
+			return child.ResourceKey().Kind != kube.ReplicaSetKind
+		})
+
+		assert.ElementsMatch(t,
+			[]kube.ResourceKey{
+				kube.GetResourceKey(mustToUnstructured(testDeploy())),
+				kube.GetResourceKey(mustToUnstructured(testRS())),
+			},
+			keys)
+	})
+
+	t.Run("ExitAtThirdLevelChild", func(t *testing.T) {
+		keys := []kube.ResourceKey{}
+		cluster.IterateHierarchy(kube.GetResourceKey(mustToUnstructured(testDeploy())), func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			keys = append(keys, child.ResourceKey())
+			return child.ResourceKey().Kind != kube.PodKind
+		})
+
+		assert.ElementsMatch(t,
+			[]kube.ResourceKey{
+				kube.GetResourceKey(mustToUnstructured(testDeploy())),
+				kube.GetResourceKey(mustToUnstructured(testRS())),
+				kube.GetResourceKey(mustToUnstructured(testPod())),
+			},
+			keys)
+	})
 }

@@ -11,18 +11,22 @@ import (
 
 	"github.com/go-logr/logr"
 	"golang.org/x/sync/semaphore"
+	v1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/managedfields"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/pager"
 	watchutil "k8s.io/client-go/tools/watch"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2/klogr"
 	"k8s.io/kubectl/pkg/util/openapi"
 
@@ -31,10 +35,14 @@ import (
 )
 
 const (
-	clusterResyncTimeout       = 24 * time.Hour
-	watchResyncTimeout         = 10 * time.Minute
 	watchResourcesRetryTimeout = 1 * time.Second
 	ClusterRetryTimeout        = 10 * time.Second
+
+	// default duration before we invalidate entire cluster cache. Can be set to 0 to never invalidate cache
+	defaultClusterResyncTimeout = 24 * time.Hour
+
+	// default duration before restarting individual resource watch
+	defaultWatchResyncTimeout = 10 * time.Minute
 
 	// Same page size as in k8s.io/client-go/tools/pager/pager.go
 	defaultListPageSize = 500
@@ -66,8 +74,8 @@ type ClusterInfo struct {
 	LastCacheSyncTime *time.Time
 	// SyncError holds most recent cache synchronization error
 	SyncError error
-	// APIGroups holds list of API groups supported by the cluster
-	APIGroups []metav1.APIGroup
+	// APIResources holds list of API resources supported by the cluster
+	APIResources []kube.APIResourceInfo
 }
 
 // OnEventHandler is a function that handles Kubernetes event
@@ -85,16 +93,20 @@ type ClusterCache interface {
 	EnsureSynced() error
 	// GetServerVersion returns observed cluster version
 	GetServerVersion() string
-	// GetAPIGroups returns information about observed API groups
-	GetAPIGroups() []metav1.APIGroup
+	// GetAPIResources returns information about observed API resources
+	GetAPIResources() []kube.APIResourceInfo
 	// GetOpenAPISchema returns open API schema of supported API resources
 	GetOpenAPISchema() openapi.Resources
+	// GetGVKParser returns a parser able to build a TypedValue used in
+	// structured merge diffs.
+	GetGVKParser() *managedfields.GvkParser
 	// Invalidate cache and executes callback that optionally might update cache settings
 	Invalidate(opts ...UpdateSettingsFunc)
 	// FindResources returns resources that matches given list of predicates from specified namespace or everywhere if specified namespace is empty
 	FindResources(namespace string, predicates ...func(r *Resource) bool) map[kube.ResourceKey]*Resource
-	// IterateHierarchy iterates resource tree starting from the specified top level resource and executes callback for each resource in the tree
-	IterateHierarchy(key kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource))
+	// IterateHierarchy iterates resource tree starting from the specified top level resource and executes callback for each resource in the tree.
+	// The action callback returns true if iteration should continue and false otherwise.
+	IterateHierarchy(key kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool)
 	// IsNamespaced answers if specified group/kind is a namespaced resource API or not
 	IsNamespaced(gk schema.GroupKind) (bool, error)
 	// GetManagedLiveObjs helps finding matching live K8S resources for a given resources list.
@@ -115,6 +127,8 @@ type WeightedSemaphore interface {
 	Release(n int64)
 }
 
+type ListRetryFunc func(err error) bool
+
 // NewClusterCache creates new instance of cluster cache
 func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCache {
 	log := klogr.New()
@@ -132,12 +146,17 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 			Tracer: tracing.NopTracer{},
 		},
 		syncStatus: clusterCacheSync{
-			resyncTimeout: clusterResyncTimeout,
+			resyncTimeout: defaultClusterResyncTimeout,
 			syncTime:      nil,
 		},
+		watchResyncTimeout:      defaultWatchResyncTimeout,
+		clusterSyncRetryTimeout: ClusterRetryTimeout,
 		resourceUpdatedHandlers: map[uint64]OnResourceUpdatedHandler{},
 		eventHandlers:           map[uint64]OnEventHandler{},
 		log:                     log,
+		listRetryLimit:          1,
+		listRetryUseBackoff:     false,
+		listRetryFunc:           ListRetryFuncNever,
 	}
 	for i := range opts {
 		opts[i](cache)
@@ -150,15 +169,25 @@ type clusterCache struct {
 
 	apisMeta      map[schema.GroupKind]*apiMeta
 	serverVersion string
-	apiGroups     []metav1.APIGroup
+	apiResources  []kube.APIResourceInfo
 	// namespacedResources is a simple map which indicates a groupKind is namespaced
 	namespacedResources map[schema.GroupKind]bool
+
+	// maximum time we allow watches to run before relisting the group/kind and restarting the watch
+	watchResyncTimeout time.Duration
+	// sync retry timeout for cluster when sync error happens
+	clusterSyncRetryTimeout time.Duration
 
 	// size of a page for list operations pager.
 	listPageSize int64
 	// number of pages to prefetch for list pager.
 	listPageBufferSize int32
 	listSemaphore      WeightedSemaphore
+
+	// retry options for list operations
+	listRetryLimit      int32
+	listRetryUseBackoff bool
+	listRetryFunc       ListRetryFunc
 
 	// lock is a rw lock which protects the fields of clusterInfo
 	lock      sync.RWMutex
@@ -178,6 +207,7 @@ type clusterCache struct {
 	resourceUpdatedHandlers     map[uint64]OnResourceUpdatedHandler
 	eventHandlers               map[uint64]OnEventHandler
 	openAPISchema               openapi.Resources
+	gvkParser                   *managedfields.GvkParser
 }
 
 type clusterCacheSync struct {
@@ -189,6 +219,16 @@ type clusterCacheSync struct {
 	syncTime      *time.Time
 	syncError     error
 	resyncTimeout time.Duration
+}
+
+// ListRetryFuncNever never retries on errors
+func ListRetryFuncNever(err error) bool {
+	return false
+}
+
+// ListRetryFuncAlways always retries on errors
+func ListRetryFuncAlways(err error) bool {
+	return true
 }
 
 // OnResourceUpdated register event handler that is executed every time when resource get's updated in the cache
@@ -244,12 +284,12 @@ func (c *clusterCache) GetServerVersion() string {
 	return c.serverVersion
 }
 
-// GetAPIGroups returns information about observed API groups
-func (c *clusterCache) GetAPIGroups() []metav1.APIGroup {
+// GetAPIResources returns information about observed API resources
+func (c *clusterCache) GetAPIResources() []kube.APIResourceInfo {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
-	return c.apiGroups
+	return c.apiResources
 }
 
 // GetOpenAPISchema returns open API schema of supported API resources
@@ -257,24 +297,30 @@ func (c *clusterCache) GetOpenAPISchema() openapi.Resources {
 	return c.openAPISchema
 }
 
-func (c *clusterCache) appendAPIGroups(apiGroup metav1.APIGroup) {
+// GetGVKParser returns a parser able to build a TypedValue used in
+// structured merge diffs.
+func (c *clusterCache) GetGVKParser() *managedfields.GvkParser {
+	return c.gvkParser
+}
+
+func (c *clusterCache) appendAPIResource(info kube.APIResourceInfo) {
 	exists := false
-	for i := range c.apiGroups {
-		if c.apiGroups[i].Name == apiGroup.Name {
+	for i := range c.apiResources {
+		if c.apiResources[i].GroupKind == info.GroupKind && c.apiResources[i].GroupVersionResource.Version == info.GroupVersionResource.Version {
 			exists = true
 			break
 		}
 	}
 	if !exists {
-		c.apiGroups = append(c.apiGroups, apiGroup)
+		c.apiResources = append(c.apiResources, info)
 	}
 }
 
-func (c *clusterCache) DeleteAPIGroup(apiGroup metav1.APIGroup) {
-	for i := range c.apiGroups {
-		if c.apiGroups[i].Name == apiGroup.Name {
-			c.apiGroups[i] = c.apiGroups[len(c.apiGroups)-1]
-			c.apiGroups = c.apiGroups[:len(c.apiGroups)-1]
+func (c *clusterCache) deleteAPIResource(info kube.APIResourceInfo) {
+	for i := range c.apiResources {
+		if c.apiResources[i].GroupKind == info.GroupKind && c.apiResources[i].GroupVersionResource.Version == info.GroupVersionResource.Version {
+			c.apiResources[i] = c.apiResources[len(c.apiResources)-1]
+			c.apiResources = c.apiResources[:len(c.apiResources)-1]
 			break
 		}
 	}
@@ -379,14 +425,18 @@ func (c *clusterCache) Invalidate(opts ...UpdateSettingsFunc) {
 }
 
 // clusterCacheSync's lock should be held before calling this method
-func (syncStatus *clusterCacheSync) synced() bool {
+func (syncStatus *clusterCacheSync) synced(clusterRetryTimeout time.Duration) bool {
 	syncTime := syncStatus.syncTime
 
 	if syncTime == nil {
 		return false
 	}
 	if syncStatus.syncError != nil {
-		return time.Now().Before(syncTime.Add(ClusterRetryTimeout))
+		return time.Now().Before(syncTime.Add(clusterRetryTimeout))
+	}
+	if syncStatus.resyncTimeout == 0 {
+		// cluster resync timeout has been disabled
+		return true
 	}
 	return time.Now().Before(syncTime.Add(syncStatus.resyncTimeout))
 }
@@ -404,7 +454,7 @@ func (c *clusterCache) stopWatching(gk schema.GroupKind, ns string) {
 
 // startMissingWatches lists supported cluster resources and start watching for changes unless watch is already running
 func (c *clusterCache) startMissingWatches() error {
-	apis, err := c.kubectl.GetAPIResources(c.config, c.settings.ResourcesFilter)
+	apis, err := c.kubectl.GetAPIResources(c.config, true, c.settings.ResourcesFilter)
 	if err != nil {
 		return err
 	}
@@ -445,12 +495,33 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 		return "", err
 	}
 	defer c.listSemaphore.Release(1)
+	var retryCount int64 = 0
 	resourceVersion := ""
 	listPager := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
-		res, err := resClient.List(ctx, opts)
-		if err == nil {
-			resourceVersion = res.GetResourceVersion()
+		var res *unstructured.UnstructuredList
+		var listRetry wait.Backoff
+
+		if c.listRetryUseBackoff {
+			listRetry = retry.DefaultBackoff
+		} else {
+			listRetry = retry.DefaultRetry
 		}
+
+		listRetry.Steps = int(c.listRetryLimit)
+		err := retry.OnError(listRetry, c.listRetryFunc, func() error {
+			var ierr error
+			res, ierr = resClient.List(ctx, opts)
+			if ierr != nil {
+				// Log out a retry
+				if c.listRetryLimit > 1 && c.listRetryFunc(ierr) {
+					retryCount += 1
+					c.log.Info(fmt.Sprintf("Error while listing resources: %v (try %d/%d)", ierr, retryCount, c.listRetryLimit))
+				}
+				return ierr
+			}
+			resourceVersion = res.GetResourceVersion()
+			return nil
+		})
 		return res, err
 	})
 	listPager.PageBufferSize = c.listPageBufferSize
@@ -513,8 +584,12 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 			resourceVersion = ""
 		}()
 
-		shouldResync := time.NewTimer(watchResyncTimeout)
-		defer shouldResync.Stop()
+		var watchResyncTimeoutCh <-chan time.Time
+		if c.watchResyncTimeout > 0 {
+			shouldResync := time.NewTimer(c.watchResyncTimeout)
+			defer shouldResync.Stop()
+			watchResyncTimeoutCh = shouldResync.C
+		}
 
 		for {
 			select {
@@ -523,7 +598,7 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 				return nil
 
 			// re-synchronize API state and restart watch periodically
-			case <-shouldResync.C:
+			case <-watchResyncTimeoutCh:
 				return fmt.Errorf("Resyncing %s on %s during to timeout", api.GroupKind, c.config.Host)
 
 			// re-synchronize API state and restart watch if retry watcher failed to continue watching using provided resource version
@@ -542,37 +617,40 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 
 				c.processEvent(event.Type, obj)
 				if kube.IsCRD(obj) {
-					var apiGroup metav1.APIGroup
-					name, nameOK, nameErr := unstructured.NestedString(obj.Object, "metadata", "name")
-					group, groupOk, groupErr := unstructured.NestedString(obj.Object, "spec", "group")
-					version, versionOK, versionErr := unstructured.NestedString(obj.Object, "spec", "version")
-					if nameOK && nameErr == nil {
-						apiGroup.Name = name
-						var groupVersions []metav1.GroupVersionForDiscovery
-						if groupOk && groupErr == nil && versionOK && versionErr == nil {
-							groupVersion := metav1.GroupVersionForDiscovery{
-								GroupVersion: group + "/" + version,
-								Version:      version,
-							}
-							groupVersions = append(groupVersions, groupVersion)
-						}
-						apiGroup.Versions = groupVersions
+					var resources []kube.APIResourceInfo
+					crd := v1.CustomResourceDefinition{}
+					err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &crd)
+					if err != nil {
+						c.log.Error(err, "Failed to extract CRD resources")
+					}
+					for _, v := range crd.Spec.Versions {
+						resources = append(resources, kube.APIResourceInfo{
+							GroupKind: schema.GroupKind{
+								Group: crd.Spec.Group, Kind: crd.Spec.Names.Kind},
+							GroupVersionResource: schema.GroupVersionResource{
+								Group: crd.Spec.Group, Version: v.Name, Resource: crd.Spec.Names.Plural},
+							Meta: metav1.APIResource{
+								Group:        crd.Spec.Group,
+								SingularName: crd.Spec.Names.Singular,
+								Namespaced:   crd.Spec.Scope == v1.NamespaceScoped,
+								Name:         crd.Spec.Names.Plural,
+								Kind:         crd.Spec.Names.Singular,
+								Version:      v.Name,
+								ShortNames:   crd.Spec.Names.ShortNames,
+							},
+						})
 					}
 
 					if event.Type == watch.Deleted {
-						kind, kindOk, kindErr := unstructured.NestedString(obj.Object, "spec", "names", "kind")
-						if groupOk && groupErr == nil && kindOk && kindErr == nil {
-							gk := schema.GroupKind{Group: group, Kind: kind}
-							c.stopWatching(gk, ns)
-						}
-						// remove CRD's groupkind from c.apigroups
-						if nameOK && nameErr == nil {
-							c.DeleteAPIGroup(apiGroup)
+						for i := range resources {
+							c.deleteAPIResource(resources[i])
 						}
 					} else {
 						// add new CRD's groupkind to c.apigroups
-						if event.Type == watch.Added && nameOK && nameErr == nil {
-							c.appendAPIGroups(apiGroup)
+						if event.Type == watch.Added {
+							for i := range resources {
+								c.appendAPIResource(resources[i])
+							}
 						}
 						err = runSynced(&c.lock, func() error {
 							return c.startMissingWatches()
@@ -582,9 +660,16 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 						}
 					}
 					err = runSynced(&c.lock, func() error {
-						openAPISchema, err := c.kubectl.LoadOpenAPISchema(c.config)
+						openAPISchema, gvkParser, err := c.kubectl.LoadOpenAPISchema(c.config)
 						if err != nil {
-							return err
+							e, ok := err.(*kube.CreateGVKParserError)
+							if !ok {
+								return err
+							}
+							c.log.Info("warning loading openapi schema: %s", e)
+						}
+						if gvkParser != nil {
+							c.gvkParser = gvkParser
 						}
 						c.openAPISchema = openAPISchema
 						return nil
@@ -633,19 +718,28 @@ func (c *clusterCache) sync() error {
 		return err
 	}
 	c.serverVersion = version
-	groups, err := c.kubectl.GetAPIGroups(config)
+	apiResources, err := c.kubectl.GetAPIResources(config, false, NewNoopSettings())
 	if err != nil {
 		return err
 	}
-	c.apiGroups = groups
+	c.apiResources = apiResources
 
-	openAPISchema, err := c.kubectl.LoadOpenAPISchema(config)
+	openAPISchema, gvkParser, err := c.kubectl.LoadOpenAPISchema(config)
 	if err != nil {
-		return err
+		e, ok := err.(*kube.CreateGVKParserError)
+		if !ok {
+			return err
+		}
+		c.log.Info("warning loading openapi schema: %s", e)
 	}
+
+	if gvkParser != nil {
+		c.gvkParser = gvkParser
+	}
+
 	c.openAPISchema = openAPISchema
 
-	apis, err := c.kubectl.GetAPIResources(c.config, c.settings.ResourcesFilter)
+	apis, err := c.kubectl.GetAPIResources(c.config, true, c.settings.ResourcesFilter)
 
 	if err != nil {
 		return err
@@ -702,7 +796,7 @@ func (c *clusterCache) EnsureSynced() error {
 
 	// first check if cluster is synced *without acquiring the full clusterCache lock*
 	syncStatus.lock.Lock()
-	if syncStatus.synced() {
+	if syncStatus.synced(c.clusterSyncRetryTimeout) {
 		syncError := syncStatus.syncError
 		syncStatus.lock.Unlock()
 		return syncError
@@ -716,7 +810,7 @@ func (c *clusterCache) EnsureSynced() error {
 
 	// before doing any work, check once again now that we have the lock, to see if it got
 	// synced between the first check and now
-	if syncStatus.synced() {
+	if syncStatus.synced(c.clusterSyncRetryTimeout) {
 		return syncStatus.syncError
 	}
 	err := c.sync()
@@ -757,12 +851,14 @@ func (c *clusterCache) FindResources(namespace string, predicates ...func(r *Res
 }
 
 // IterateHierarchy iterates resource tree starting from the specified top level resource and executes callback for each resource in the tree
-func (c *clusterCache) IterateHierarchy(key kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource)) {
+func (c *clusterCache) IterateHierarchy(key kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 	if res, ok := c.resources[key]; ok {
 		nsNodes := c.nsIndex[key.Namespace]
-		action(res, nsNodes)
+		if !action(res, nsNodes) {
+			return
+		}
 		childrenByUID := make(map[types.UID][]*Resource)
 		for _, child := range nsNodes {
 			if res.isParentOf(child) {
@@ -780,14 +876,15 @@ func (c *clusterCache) IterateHierarchy(key kube.ResourceKey, action func(resour
 					return strings.Compare(key1.String(), key2.String()) < 0
 				})
 				child := children[0]
-				action(child, nsNodes)
-				child.iterateChildren(nsNodes, map[kube.ResourceKey]bool{res.ResourceKey(): true}, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) {
-					if err != nil {
-						c.log.V(2).Info(err.Error())
-						return
-					}
-					action(child, namespaceResources)
-				})
+				if action(child, nsNodes) {
+					child.iterateChildren(nsNodes, map[kube.ResourceKey]bool{res.ResourceKey(): true}, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool {
+						if err != nil {
+							c.log.V(2).Info(err.Error())
+							return false
+						}
+						return action(child, namespaceResources)
+					})
+				}
 			}
 		}
 	}
@@ -902,7 +999,7 @@ func (c *clusterCache) processEvent(event watch.EventType, un *unstructured.Unst
 		h(event, un)
 	}
 	key := kube.GetResourceKey(un)
-	if event == watch.Modified && skipAppRequeing(key) {
+	if event == watch.Modified && skipAppRequeuing(key) {
 		return
 	}
 
@@ -970,12 +1067,12 @@ func (c *clusterCache) GetClusterInfo() ClusterInfo {
 		Server:            c.config.Host,
 		LastCacheSyncTime: c.syncStatus.syncTime,
 		SyncError:         c.syncStatus.syncError,
-		APIGroups:         c.apiGroups,
+		APIResources:      c.apiResources,
 	}
 }
 
-// skipAppRequeing checks if the object is an API type which we want to skip requeuing against.
+// skipAppRequeuing checks if the object is an API type which we want to skip requeuing against.
 // We ignore API types which have a high churn rate, and/or whose updates are irrelevant to the app
-func skipAppRequeing(key kube.ResourceKey) bool {
+func skipAppRequeuing(key kube.ResourceKey) bool {
 	return ignoredRefreshResources[key.Group+"/"+key.Kind]
 }

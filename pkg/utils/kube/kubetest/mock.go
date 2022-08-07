@@ -8,6 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/managedfields"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
@@ -28,11 +29,28 @@ type MockKubectlCmd struct {
 	Events        chan watch.Event
 	Version       string
 	DynamicClient dynamic.Interface
-	APIGroups     []metav1.APIGroup
 
 	lastCommandPerResource map[kube.ResourceKey]string
 	lastValidate           bool
-	recordLock             sync.RWMutex
+	serverSideApply        bool
+	serverSideApplyManager string
+
+	recordLock sync.RWMutex
+
+	convertToVersionFunc *func(obj *unstructured.Unstructured, group, version string) (*unstructured.Unstructured, error)
+	getResourceFunc      *func(ctx context.Context, config *rest.Config, gvk schema.GroupVersionKind, name string, namespace string) (*unstructured.Unstructured, error)
+}
+
+// WithConvertToVersionFunc overrides the default ConvertToVersion behavior.
+func (k *MockKubectlCmd) WithConvertToVersionFunc(convertToVersionFunc func(*unstructured.Unstructured, string, string) (*unstructured.Unstructured, error)) *MockKubectlCmd {
+	k.convertToVersionFunc = &convertToVersionFunc
+	return k
+}
+
+// WithGetResourceFunc overrides the default ConvertToVersion behavior.
+func (k *MockKubectlCmd) WithGetResourceFunc(getResourcefunc func(context.Context, *rest.Config, schema.GroupVersionKind, string, string) (*unstructured.Unstructured, error)) *MockKubectlCmd {
+	k.getResourceFunc = &getResourcefunc
+	return k
 }
 
 func (k *MockKubectlCmd) GetLastResourceCommand(key kube.ResourceKey) string {
@@ -66,15 +84,45 @@ func (k *MockKubectlCmd) GetLastValidate() bool {
 	return validate
 }
 
+func (k *MockKubectlCmd) SetLastServerSideApply(serverSideApply bool) {
+	k.recordLock.Lock()
+	k.serverSideApply = serverSideApply
+	k.recordLock.Unlock()
+}
+
+func (k *MockKubectlCmd) SetLastServerSideApplyManager(manager string) {
+	k.recordLock.Lock()
+	k.serverSideApplyManager = manager
+	k.recordLock.Unlock()
+}
+
+func (k *MockKubectlCmd) GetLastServerSideApplyManager() string {
+	k.recordLock.Lock()
+	manager := k.serverSideApplyManager
+	k.recordLock.Unlock()
+	return manager
+}
+
+func (k *MockKubectlCmd) GetLastServerSideApply() bool {
+	k.recordLock.RLock()
+	serverSideApply := k.serverSideApply
+	k.recordLock.RUnlock()
+	return serverSideApply
+}
+
 func (k *MockKubectlCmd) NewDynamicClient(config *rest.Config) (dynamic.Interface, error) {
 	return k.DynamicClient, nil
 }
 
-func (k *MockKubectlCmd) GetAPIResources(config *rest.Config, resourceFilter kube.ResourceFilter) ([]kube.APIResourceInfo, error) {
+func (k *MockKubectlCmd) GetAPIResources(config *rest.Config, preferred bool, resourceFilter kube.ResourceFilter) ([]kube.APIResourceInfo, error) {
 	return k.APIResources, nil
 }
 
 func (k *MockKubectlCmd) GetResource(ctx context.Context, config *rest.Config, gvk schema.GroupVersionKind, name string, namespace string) (*unstructured.Unstructured, error) {
+	if k.getResourceFunc != nil {
+		return (*k.getResourceFunc)(ctx, config, gvk, name, namespace)
+	}
+
 	return nil, nil
 }
 
@@ -108,8 +156,10 @@ func (k *MockKubectlCmd) UpdateResource(ctx context.Context, obj *unstructured.U
 	return obj, command.Err
 }
 
-func (k *MockKubectlCmd) ApplyResource(ctx context.Context, obj *unstructured.Unstructured, dryRunStrategy cmdutil.DryRunStrategy, force, validate bool) (string, error) {
+func (k *MockKubectlCmd) ApplyResource(ctx context.Context, obj *unstructured.Unstructured, dryRunStrategy cmdutil.DryRunStrategy, force, validate, serverSideApply bool, manager string) (string, error) {
 	k.SetLastValidate(validate)
+	k.SetLastServerSideApply(serverSideApply)
+	k.SetLastServerSideApplyManager(manager)
 	k.SetLastResourceCommand(kube.GetResourceKey(obj), "apply")
 	command, ok := k.Commands[obj.GetName()]
 	if !ok {
@@ -129,6 +179,10 @@ func (k *MockKubectlCmd) ReplaceResource(ctx context.Context, obj *unstructured.
 
 // ConvertToVersion converts an unstructured object into the specified group/version
 func (k *MockKubectlCmd) ConvertToVersion(obj *unstructured.Unstructured, group, version string) (*unstructured.Unstructured, error) {
+	if k.convertToVersionFunc != nil {
+		return (*k.convertToVersionFunc)(obj, group, version)
+	}
+
 	return obj, nil
 }
 
@@ -136,12 +190,8 @@ func (k *MockKubectlCmd) GetServerVersion(config *rest.Config) (string, error) {
 	return k.Version, nil
 }
 
-func (k *MockKubectlCmd) GetAPIGroups(config *rest.Config) ([]metav1.APIGroup, error) {
-	return k.APIGroups, nil
-}
-
-func (k *MockKubectlCmd) LoadOpenAPISchema(config *rest.Config) (openapi.Resources, error) {
-	return nil, nil
+func (k *MockKubectlCmd) LoadOpenAPISchema(config *rest.Config) (openapi.Resources, *managedfields.GvkParser, error) {
+	return nil, nil, nil
 }
 
 func (k *MockKubectlCmd) SetOnKubectlRun(onKubectlRun kube.OnKubectlRunFunc) {
