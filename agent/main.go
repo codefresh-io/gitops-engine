@@ -5,11 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
+	"github.com/argoproj/gitops-engine/pkg/utils/text"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -24,10 +25,15 @@ import (
 	"github.com/argoproj/gitops-engine/pkg/engine"
 	"github.com/argoproj/gitops-engine/pkg/sync"
 	"github.com/argoproj/gitops-engine/pkg/utils/kube"
+
+	_ "net/http/pprof"
 )
 
 const (
 	annotationGCMark = "gitops-agent.argoproj.io/gc-mark"
+	envProfile       = "GITOPS_ENGINE_PROFILE"
+	envProfileHost   = "GITOPS_ENGINE_PROFILE_HOST"
+	envProfilePort   = "GITOPS_ENGINE_PROFILE_PORT"
 )
 
 func main() {
@@ -71,7 +77,7 @@ func (s *settings) parseManifests() ([]*unstructured.Unstructured, string, error
 			if ext := strings.ToLower(filepath.Ext(info.Name())); ext != ".json" && ext != ".yml" && ext != ".yaml" {
 				return nil
 			}
-			data, err := ioutil.ReadFile(path)
+			data, err := os.ReadFile(path)
 			if err != nil {
 				return err
 			}
@@ -94,6 +100,19 @@ func (s *settings) parseManifests() ([]*unstructured.Unstructured, string, error
 		res[i].SetAnnotations(annotations)
 	}
 	return res, string(revision), nil
+}
+
+func StartProfiler(log logr.Logger) {
+	if os.Getenv(envProfile) == "web" {
+		go func() {
+			runtime.SetBlockProfileRate(1)
+			runtime.SetMutexProfileFraction(1)
+			profilePort := text.WithDefault(os.Getenv(envProfilePort), "6060")
+			profileHost := text.WithDefault(os.Getenv(envProfileHost), "127.0.0.1")
+
+			log.Info("pprof", "err", http.ListenAndServe(fmt.Sprintf("%s:%s", profileHost, profilePort), nil))
+		}()
+	}
 }
 
 func newCmd(log logr.Logger) *cobra.Command {
@@ -125,6 +144,8 @@ func newCmd(log logr.Logger) *cobra.Command {
 			if namespaced {
 				namespaces = []string{namespace}
 			}
+
+			StartProfiler(log)
 			clusterCache := cache.NewClusterCache(config,
 				cache.SetNamespaces(namespaces),
 				cache.SetLogr(log),

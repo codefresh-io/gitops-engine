@@ -1,18 +1,27 @@
 package sync
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"k8s.io/kubectl/pkg/cmd/util"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/discovery"
 	fakedisco "k8s.io/client-go/discovery/fake"
 	"k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/rest"
@@ -21,6 +30,7 @@ import (
 
 	"github.com/argoproj/gitops-engine/pkg/diff"
 	"github.com/argoproj/gitops-engine/pkg/health"
+	"github.com/argoproj/gitops-engine/pkg/sync/common"
 	synccommon "github.com/argoproj/gitops-engine/pkg/sync/common"
 	"github.com/argoproj/gitops-engine/pkg/utils/kube"
 	"github.com/argoproj/gitops-engine/pkg/utils/kube/kubetest"
@@ -30,7 +40,7 @@ import (
 
 var standardVerbs = v1.Verbs{"create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"}
 
-func newTestSyncCtx(opts ...SyncOpt) *syncContext {
+func newTestSyncCtx(getResourceFunc *func(ctx context.Context, config *rest.Config, gvk schema.GroupVersionKind, name string, namespace string) (*unstructured.Unstructured, error), opts ...SyncOpt) *syncContext {
 	fakeDisco := &fakedisco.FakeDiscovery{Fake: &testcore.Fake{}}
 	fakeDisco.Resources = append(make([]*v1.APIResourceList, 0),
 		&v1.APIResourceList{
@@ -62,8 +72,15 @@ func newTestSyncCtx(opts ...SyncOpt) *syncContext {
 		return nil
 	}
 	mockKubectl := kubetest.MockKubectlCmd{}
+
 	sc.kubectl = &mockKubectl
-	sc.resourceOps = &mockKubectl
+	mockResourceOps := kubetest.MockResourceOps{}
+	sc.resourceOps = &mockResourceOps
+	if getResourceFunc != nil {
+		mockKubectl.WithGetResourceFunc(*getResourceFunc)
+		mockResourceOps.WithGetResourceFunc(*getResourceFunc)
+	}
+
 	for _, opt := range opts {
 		opt(&sc)
 	}
@@ -72,7 +89,7 @@ func newTestSyncCtx(opts ...SyncOpt) *syncContext {
 
 // make sure Validate means we don't validate
 func TestSyncValidate(t *testing.T) {
-	syncCtx := newTestSyncCtx()
+	syncCtx := newTestSyncCtx(nil)
 	pod := NewPod()
 	pod.SetNamespace("fake-argocd-ns")
 	syncCtx.resources = groupResources(ReconciliationResult{
@@ -83,12 +100,13 @@ func TestSyncValidate(t *testing.T) {
 
 	syncCtx.Sync()
 
-	kubectl := syncCtx.kubectl.(*kubetest.MockKubectlCmd)
-	assert.False(t, kubectl.GetLastValidate())
+	// kubectl := syncCtx.kubectl.(*kubetest.MockKubectlCmd)
+	resourceOps, _ := syncCtx.resourceOps.(*kubetest.MockResourceOps)
+	assert.False(t, resourceOps.GetLastValidate())
 }
 
 func TestSyncNotPermittedNamespace(t *testing.T) {
-	syncCtx := newTestSyncCtx(WithPermissionValidator(func(un *unstructured.Unstructured, res *v1.APIResource) error {
+	syncCtx := newTestSyncCtx(nil, WithPermissionValidator(func(un *unstructured.Unstructured, res *v1.APIResource) error {
 		return fmt.Errorf("not permitted in project")
 	}))
 	targetPod := NewPod()
@@ -104,7 +122,7 @@ func TestSyncNotPermittedNamespace(t *testing.T) {
 }
 
 func TestSyncCreateInSortedOrder(t *testing.T) {
-	syncCtx := newTestSyncCtx()
+	syncCtx := newTestSyncCtx(nil)
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{nil, nil},
 		Target: []*unstructured.Unstructured{NewPod(), NewService()},
@@ -166,7 +184,7 @@ func TestSyncCustomResources(t *testing.T) {
 				knownCustomResourceTypes = append(knownCustomResourceTypes, v1.APIResource{Kind: "TestCrd", Group: "argoproj.io", Version: "v1", Namespaced: true, Verbs: standardVerbs})
 			}
 
-			syncCtx := newTestSyncCtx()
+			syncCtx := newTestSyncCtx(nil)
 			fakeDisco := syncCtx.disco.(*fakedisco.FakeDiscovery)
 			fakeDisco.Resources = []*v1.APIResourceList{{
 				GroupVersion: "argoproj.io/v1",
@@ -228,7 +246,7 @@ func TestSyncCustomResources(t *testing.T) {
 }
 
 func TestSyncSuccessfully(t *testing.T) {
-	syncCtx := newTestSyncCtx(WithOperationSettings(false, true, false, false))
+	syncCtx := newTestSyncCtx(nil, WithOperationSettings(false, true, false, false))
 	pod := NewPod()
 	pod.SetNamespace(FakeArgoCDNamespace)
 	syncCtx.resources = groupResources(ReconciliationResult{
@@ -256,7 +274,7 @@ func TestSyncSuccessfully(t *testing.T) {
 }
 
 func TestSyncDeleteSuccessfully(t *testing.T) {
-	syncCtx := newTestSyncCtx(WithOperationSettings(false, true, false, false))
+	syncCtx := newTestSyncCtx(nil, WithOperationSettings(false, true, false, false))
 	svc := NewService()
 	svc.SetNamespace(FakeArgoCDNamespace)
 	pod := NewPod()
@@ -285,7 +303,7 @@ func TestSyncDeleteSuccessfully(t *testing.T) {
 }
 
 func TestSyncCreateFailure(t *testing.T) {
-	syncCtx := newTestSyncCtx()
+	syncCtx := newTestSyncCtx(nil)
 	testSvc := NewService()
 	mockKubectl := &kubetest.MockKubectlCmd{
 		Commands: map[string]kubetest.KubectlOutput{
@@ -296,7 +314,15 @@ func TestSyncCreateFailure(t *testing.T) {
 		},
 	}
 	syncCtx.kubectl = mockKubectl
-	syncCtx.resourceOps = mockKubectl
+	mockResourceOps := &kubetest.MockResourceOps{
+		Commands: map[string]kubetest.KubectlOutput{
+			testSvc.GetName(): {
+				Output: "",
+				Err:    fmt.Errorf("foo"),
+			},
+		},
+	}
+	syncCtx.resourceOps = mockResourceOps
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{nil},
 		Target: []*unstructured.Unstructured{testSvc},
@@ -319,7 +345,7 @@ func TestSync_ApplyOutOfSyncOnly(t *testing.T) {
 	pod3 := NewPod()
 	pod3.SetName("pod-3")
 
-	syncCtx := newTestSyncCtx()
+	syncCtx := newTestSyncCtx(nil)
 	syncCtx.applyOutOfSyncOnly = true
 	t.Run("modificationResult=nil", func(t *testing.T) {
 		syncCtx.modificationResult = nil
@@ -334,7 +360,7 @@ func TestSync_ApplyOutOfSyncOnly(t *testing.T) {
 		assert.Len(t, resources, 3)
 	})
 
-	syncCtx = newTestSyncCtx(WithResourceModificationChecker(true, diffResultList()))
+	syncCtx = newTestSyncCtx(nil, WithResourceModificationChecker(true, diffResultList()))
 	t.Run("applyOutOfSyncOnly=true", func(t *testing.T) {
 		syncCtx.resources = groupResources(ReconciliationResult{
 			Live:   []*unstructured.Unstructured{nil, pod2, pod3},
@@ -372,7 +398,7 @@ func TestSync_ApplyOutOfSyncOnly(t *testing.T) {
 	})
 
 	t.Run("applyOutOfSyncOnly=true and prune=true", func(t *testing.T) {
-		syncCtx = newTestSyncCtx(WithResourceModificationChecker(true, diffResultList()))
+		syncCtx = newTestSyncCtx(nil, WithResourceModificationChecker(true, diffResultList()))
 		syncCtx.applyOutOfSyncOnly = true
 		syncCtx.prune = true
 		syncCtx.resources = groupResources(ReconciliationResult{
@@ -397,7 +423,7 @@ func TestSync_ApplyOutOfSyncOnly(t *testing.T) {
 	})
 
 	t.Run("applyOutOfSyncOnly=true and syncwaves", func(t *testing.T) {
-		syncCtx = newTestSyncCtx(WithResourceModificationChecker(true, diffResultList()))
+		syncCtx = newTestSyncCtx(nil, WithResourceModificationChecker(true, diffResultList()))
 		syncCtx.applyOutOfSyncOnly = true
 		syncCtx.prune = true
 		pod1.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "2"})
@@ -428,7 +454,7 @@ func TestSync_ApplyOutOfSyncOnly(t *testing.T) {
 }
 
 func TestSyncPruneFailure(t *testing.T) {
-	syncCtx := newTestSyncCtx(WithOperationSettings(false, true, false, false))
+	syncCtx := newTestSyncCtx(nil, WithOperationSettings(false, true, false, false))
 	mockKubectl := &kubetest.MockKubectlCmd{
 		Commands: map[string]kubetest.KubectlOutput{
 			"test-service": {
@@ -438,7 +464,15 @@ func TestSyncPruneFailure(t *testing.T) {
 		},
 	}
 	syncCtx.kubectl = mockKubectl
-	syncCtx.resourceOps = mockKubectl
+	mockResourceOps := kubetest.MockResourceOps{
+		Commands: map[string]kubetest.KubectlOutput{
+			"test-service": {
+				Output: "",
+				Err:    fmt.Errorf("foo"),
+			},
+		},
+	}
+	syncCtx.resourceOps = &mockResourceOps
 	testSvc := NewService()
 	testSvc.SetName("test-service")
 	testSvc.SetNamespace(FakeArgoCDNamespace)
@@ -457,8 +491,211 @@ func TestSyncPruneFailure(t *testing.T) {
 	assert.Equal(t, "foo", result.Message)
 }
 
+type APIServerMock struct {
+	calls       int
+	errorStatus int
+	errorBody   []byte
+}
+
+func (s *APIServerMock) newHttpServer(t *testing.T, apiFailuresCount int) *httptest.Server {
+	t.Helper()
+	stable := metav1.APIResourceList{
+		GroupVersion: "v1",
+		APIResources: []metav1.APIResource{
+			{Name: "pods", Namespaced: true, Kind: "Pod"},
+			{Name: "services", Namespaced: true, Kind: "Service", Verbs: v1.Verbs{"get"}},
+			{Name: "namespaces", Namespaced: false, Kind: "Namespace"},
+		},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		s.calls++
+		if s.calls <= apiFailuresCount {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(s.errorStatus)
+			w.Write(s.errorBody) // nolint:errcheck
+			return
+		}
+		var list interface{}
+		switch req.URL.Path {
+		case "/api/v1":
+			list = &stable
+		case "/apis/v1":
+			list = &stable
+		default:
+			t.Logf("unexpected request: %s", req.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		output, err := json.Marshal(list)
+		if err != nil {
+			t.Errorf("unexpected encoding error: %v", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(output) // nolint:errcheck
+	}))
+	return server
+}
+
+func TestGetDryRunStrategy(t *testing.T) {
+	t.Run("no dry run", func(t *testing.T) {
+		strategy := getDryRunStrategy(false, false)
+		assert.Equal(t, util.DryRunNone, strategy)
+	})
+	t.Run("no dry run with server side apply", func(t *testing.T) {
+		strategy := getDryRunStrategy(true, false)
+		assert.Equal(t, util.DryRunNone, strategy)
+	})
+	t.Run("dry run with server side apply", func(t *testing.T) {
+		strategy := getDryRunStrategy(true, true)
+		assert.Equal(t, util.DryRunServer, strategy)
+	})
+	t.Run("dry run with client side apply", func(t *testing.T) {
+		strategy := getDryRunStrategy(false, true)
+		assert.Equal(t, util.DryRunClient, strategy)
+	})
+}
+
+func TestServerResourcesRetry(t *testing.T) {
+	type fixture struct {
+		apiServerMock *APIServerMock
+		httpServer    *httptest.Server
+		syncCtx       *syncContext
+	}
+	setup := func(t *testing.T, apiFailuresCount int) *fixture {
+		t.Helper()
+		syncCtx := newTestSyncCtx(nil, WithOperationSettings(false, false, false, true))
+
+		unauthorizedStatus := &metav1.Status{
+			Status:  metav1.StatusFailure,
+			Code:    http.StatusUnauthorized,
+			Reason:  metav1.StatusReasonUnauthorized,
+			Message: "some error",
+		}
+		unauthorizedJSON, err := json.Marshal(unauthorizedStatus)
+		if err != nil {
+			t.Errorf("unexpected encoding error while marshaling unauthorizedStatus: %v", err)
+			return nil
+		}
+		server := &APIServerMock{
+			errorStatus: http.StatusUnauthorized,
+			errorBody:   unauthorizedJSON,
+		}
+		httpServer := server.newHttpServer(t, apiFailuresCount)
+
+		syncCtx.disco = discovery.NewDiscoveryClientForConfigOrDie(&rest.Config{Host: httpServer.URL})
+		testSvc := NewService()
+		testSvc.SetName("test-service")
+		testSvc.SetNamespace(FakeArgoCDNamespace)
+		syncCtx.resources = groupResources(ReconciliationResult{
+			Live:   []*unstructured.Unstructured{testSvc, testSvc, testSvc, testSvc},
+			Target: []*unstructured.Unstructured{testSvc, testSvc, testSvc, testSvc},
+		})
+		return &fixture{
+			apiServerMock: server,
+			httpServer:    httpServer,
+			syncCtx:       syncCtx,
+		}
+
+	}
+	type testCase struct {
+		desc               string
+		apiFailureCount    int
+		apiErrorHTTPStatus int
+		expectedAPICalls   int
+		expectedResources  int
+		expectedPhase      synccommon.OperationPhase
+		expectedMessage    string
+	}
+	testCases := []testCase{
+		{
+			desc:              "will return success when no api failure",
+			apiFailureCount:   0,
+			expectedAPICalls:  1,
+			expectedResources: 1,
+			expectedPhase:     common.OperationSucceeded,
+			expectedMessage:   "success",
+		},
+		{
+			desc:              "will return success after 1 api failure attempt",
+			apiFailureCount:   1,
+			expectedAPICalls:  2,
+			expectedResources: 1,
+			expectedPhase:     common.OperationSucceeded,
+			expectedMessage:   "success",
+		},
+		{
+			desc:              "will return success after 2 api failure attempt",
+			apiFailureCount:   2,
+			expectedAPICalls:  3,
+			expectedResources: 1,
+			expectedPhase:     common.OperationSucceeded,
+			expectedMessage:   "success",
+		},
+		{
+			desc:              "will return success after 3 api failure attempt",
+			apiFailureCount:   3,
+			expectedAPICalls:  4,
+			expectedResources: 1,
+			expectedPhase:     common.OperationSucceeded,
+			expectedMessage:   "success",
+		},
+		{
+			desc:              "will return success after 4 api failure attempt",
+			apiFailureCount:   4,
+			expectedAPICalls:  5,
+			expectedResources: 1,
+			expectedPhase:     common.OperationSucceeded,
+			expectedMessage:   "success",
+		},
+		{
+			desc:              "will fail after 5 api failure attempt",
+			apiFailureCount:   5,
+			expectedAPICalls:  5,
+			expectedResources: 1,
+			expectedPhase:     common.OperationFailed,
+			expectedMessage:   "not valid",
+		},
+		{
+			desc:               "will not retry if returned error is different than Unauthorized",
+			apiErrorHTTPStatus: http.StatusConflict,
+			apiFailureCount:    1,
+			expectedAPICalls:   1,
+			expectedResources:  1,
+			expectedPhase:      common.OperationFailed,
+			expectedMessage:    "not valid",
+		},
+	}
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.desc, func(t *testing.T) {
+			// Given
+			t.Parallel()
+			fixture := setup(t, tc.apiFailureCount)
+			defer fixture.httpServer.Close()
+			if tc.apiErrorHTTPStatus != 0 {
+				fixture.apiServerMock.errorStatus = tc.apiErrorHTTPStatus
+			}
+
+			// When
+			fixture.syncCtx.Sync()
+			phase, msg, resources := fixture.syncCtx.GetState()
+
+			// Then
+			assert.Equal(t, tc.expectedAPICalls, fixture.apiServerMock.calls, "api calls mismatch")
+			assert.Len(t, resources, tc.expectedResources, "resources len mismatch")
+			assert.Contains(t, msg, tc.expectedMessage, "expected message mismatch")
+			require.Equal(t, tc.expectedPhase, phase, "expected phase mismatch")
+			require.Len(t, fixture.syncCtx.syncRes, 1, "sync result len mismatch")
+		})
+	}
+}
+
 func TestDoNotSyncOrPruneHooks(t *testing.T) {
-	syncCtx := newTestSyncCtx(WithOperationSettings(false, false, false, true))
+	syncCtx := newTestSyncCtx(nil, WithOperationSettings(false, false, false, true))
 	targetPod := NewPod()
 	targetPod.SetName("do-not-create-me")
 	targetPod.SetAnnotations(map[string]string{synccommon.AnnotationKeyHook: "PreSync"})
@@ -476,7 +713,7 @@ func TestDoNotSyncOrPruneHooks(t *testing.T) {
 
 // make sure that we do not prune resources with Prune=false
 func TestDoNotPrunePruneFalse(t *testing.T) {
-	syncCtx := newTestSyncCtx(WithOperationSettings(false, true, false, false))
+	syncCtx := newTestSyncCtx(nil, WithOperationSettings(false, true, false, false))
 	pod := NewPod()
 	pod.SetAnnotations(map[string]string{synccommon.AnnotationSyncOptions: "Prune=false"})
 	pod.SetNamespace(FakeArgoCDNamespace)
@@ -499,7 +736,7 @@ func TestDoNotPrunePruneFalse(t *testing.T) {
 	assert.Equal(t, synccommon.OperationSucceeded, phase)
 }
 
-//// make sure Validate=false means we don't validate
+// // make sure Validate=false means we don't validate
 func TestSyncOptionValidate(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -512,7 +749,7 @@ func TestSyncOptionValidate(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			syncCtx := newTestSyncCtx()
+			syncCtx := newTestSyncCtx(nil)
 			pod := NewPod()
 			pod.SetAnnotations(map[string]string{synccommon.AnnotationSyncOptions: tt.annotationVal})
 			pod.SetNamespace(FakeArgoCDNamespace)
@@ -523,8 +760,9 @@ func TestSyncOptionValidate(t *testing.T) {
 
 			syncCtx.Sync()
 
-			kubectl, _ := syncCtx.kubectl.(*kubetest.MockKubectlCmd)
-			assert.Equal(t, tt.want, kubectl.GetLastValidate())
+			// kubectl, _ := syncCtx.kubectl.(*kubetest.MockKubectlCmd)
+			resourceOps, _ := syncCtx.resourceOps.(*kubetest.MockResourceOps)
+			assert.Equal(t, tt.want, resourceOps.GetLastValidate())
 		})
 	}
 }
@@ -548,7 +786,7 @@ func TestSync_Replace(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			syncCtx := newTestSyncCtx()
+			syncCtx := newTestSyncCtx(nil)
 
 			tc.target.SetNamespace(FakeArgoCDNamespace)
 			if tc.live != nil {
@@ -561,8 +799,9 @@ func TestSync_Replace(t *testing.T) {
 
 			syncCtx.Sync()
 
-			kubectl, _ := syncCtx.kubectl.(*kubetest.MockKubectlCmd)
-			assert.Equal(t, tc.commandUsed, kubectl.GetLastResourceCommand(kube.GetResourceKey(tc.target)))
+			// kubectl, _ := syncCtx.kubectl.(*kubetest.MockKubectlCmd)
+			resourceOps, _ := syncCtx.resourceOps.(*kubetest.MockResourceOps)
+			assert.Equal(t, tc.commandUsed, resourceOps.GetLastResourceCommand(kube.GetResourceKey(tc.target)))
 		})
 	}
 }
@@ -589,6 +828,7 @@ func TestSync_ServerSideApply(t *testing.T) {
 		{"NoAnnotation", NewPod(), NewPod(), "apply", false, "managerA"},
 		{"ServerSideApplyAnnotationIsSet", withServerSideApplyAnnotation(NewPod()), NewPod(), "apply", true, "managerB"},
 		{"ServerSideApplyAndReplaceAnnotationsAreSet", withReplaceAndServerSideApplyAnnotations(NewPod()), NewPod(), "replace", false, ""},
+		{"ServerSideApplyAndReplaceAnnotationsAreSetNamespace", withReplaceAndServerSideApplyAnnotations(NewNamespace()), NewNamespace(), "update", false, ""},
 		{"LiveObjectMissing", withReplaceAnnotation(NewPod()), nil, "create", false, ""},
 	}
 
@@ -596,7 +836,7 @@ func TestSync_ServerSideApply(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			syncCtx := newTestSyncCtx()
+			syncCtx := newTestSyncCtx(nil)
 			syncCtx.serverSideApplyManager = tc.manager
 
 			tc.target.SetNamespace(FakeArgoCDNamespace)
@@ -610,10 +850,11 @@ func TestSync_ServerSideApply(t *testing.T) {
 
 			syncCtx.Sync()
 
-			kubectl, _ := syncCtx.kubectl.(*kubetest.MockKubectlCmd)
-			assert.Equal(t, tc.commandUsed, kubectl.GetLastResourceCommand(kube.GetResourceKey(tc.target)))
-			assert.Equal(t, tc.serverSideApply, kubectl.GetLastServerSideApply())
-			assert.Equal(t, tc.manager, kubectl.GetLastServerSideApplyManager())
+			// kubectl, _ := syncCtx.kubectl.(*kubetest.MockKubectlCmd)
+			resourceOps, _ := syncCtx.resourceOps.(*kubetest.MockResourceOps)
+			assert.Equal(t, tc.commandUsed, resourceOps.GetLastResourceCommand(kube.GetResourceKey(tc.target)))
+			assert.Equal(t, tc.serverSideApply, resourceOps.GetLastServerSideApply())
+			assert.Equal(t, tc.manager, resourceOps.GetLastServerSideApplyManager())
 		})
 	}
 }
@@ -623,7 +864,7 @@ func TestSelectiveSyncOnly(t *testing.T) {
 	pod1.SetName("pod-1")
 	pod2 := NewPod()
 	pod2.SetName("pod-2")
-	syncCtx := newTestSyncCtx(WithResourcesFilter(func(key kube.ResourceKey, _ *unstructured.Unstructured, _ *unstructured.Unstructured) bool {
+	syncCtx := newTestSyncCtx(nil, WithResourcesFilter(func(key kube.ResourceKey, _ *unstructured.Unstructured, _ *unstructured.Unstructured) bool {
 		return key.Kind == pod1.GetKind() && key.Name == pod1.GetName()
 	}))
 	syncCtx.resources = groupResources(ReconciliationResult{
@@ -639,7 +880,7 @@ func TestSelectiveSyncOnly(t *testing.T) {
 
 func TestUnnamedHooksGetUniqueNames(t *testing.T) {
 	t.Run("Truncated revision", func(t *testing.T) {
-		syncCtx := newTestSyncCtx()
+		syncCtx := newTestSyncCtx(nil)
 
 		pod := NewPod()
 		pod.SetName("")
@@ -656,7 +897,7 @@ func TestUnnamedHooksGetUniqueNames(t *testing.T) {
 	})
 
 	t.Run("Short revision", func(t *testing.T) {
-		syncCtx := newTestSyncCtx()
+		syncCtx := newTestSyncCtx(nil)
 		pod := NewPod()
 		pod.SetName("")
 		pod.SetAnnotations(map[string]string{synccommon.AnnotationKeyHook: "PreSync,PostSync"})
@@ -673,7 +914,7 @@ func TestUnnamedHooksGetUniqueNames(t *testing.T) {
 }
 
 func TestManagedResourceAreNotNamed(t *testing.T) {
-	syncCtx := newTestSyncCtx()
+	syncCtx := newTestSyncCtx(nil)
 	pod := NewPod()
 	pod.SetName("")
 
@@ -691,7 +932,7 @@ func TestManagedResourceAreNotNamed(t *testing.T) {
 }
 
 func TestDeDupingTasks(t *testing.T) {
-	syncCtx := newTestSyncCtx(WithOperationSettings(false, true, false, false))
+	syncCtx := newTestSyncCtx(nil, WithOperationSettings(false, true, false, false))
 	pod := NewPod()
 	pod.SetAnnotations(map[string]string{synccommon.AnnotationKeyHook: "Sync"})
 	syncCtx.resources = groupResources(ReconciliationResult{
@@ -707,7 +948,7 @@ func TestDeDupingTasks(t *testing.T) {
 }
 
 func TestObjectsGetANamespace(t *testing.T) {
-	syncCtx := newTestSyncCtx()
+	syncCtx := newTestSyncCtx(nil)
 	pod := NewPod()
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{nil},
@@ -725,9 +966,11 @@ func TestObjectsGetANamespace(t *testing.T) {
 func TestNamespaceAutoCreation(t *testing.T) {
 	pod := NewPod()
 	namespace := NewNamespace()
-	syncCtx := newTestSyncCtx()
-	syncCtx.createNamespace = true
+	syncCtx := newTestSyncCtx(nil)
 	syncCtx.namespace = FakeArgoCDNamespace
+	syncCtx.syncNamespace = func(m, l *unstructured.Unstructured) (bool, error) {
+		return true, nil
+	}
 	namespace.SetName(FakeArgoCDNamespace)
 
 	task, err := createNamespaceTask(syncCtx.namespace)
@@ -754,9 +997,6 @@ func TestNamespaceAutoCreation(t *testing.T) {
 			Live:   []*unstructured.Unstructured{nil},
 			Target: []*unstructured.Unstructured{pod},
 		})
-		syncCtx.namespaceModifier = func(*unstructured.Unstructured) bool {
-			return false
-		}
 		tasks, successful := syncCtx.getSyncTasks()
 
 		assert.True(t, successful)
@@ -791,6 +1031,106 @@ func TestNamespaceAutoCreation(t *testing.T) {
 		assert.Contains(t, tasks, task)
 	})
 
+	//Namespace auto creation pre-sync task not should be there
+	//since there is no namespace modifier present
+	t.Run("no pre-sync task created", func(t *testing.T) {
+		syncCtx.resources = groupResources(ReconciliationResult{
+			Live:   []*unstructured.Unstructured{nil},
+			Target: []*unstructured.Unstructured{pod},
+		})
+		syncCtx.syncNamespace = nil
+
+		res := synccommon.ResourceSyncResult{
+			ResourceKey: kube.GetResourceKey(task.obj()),
+			Version:     task.version(),
+			Status:      task.syncStatus,
+			Message:     task.message,
+			HookType:    task.hookType(),
+			HookPhase:   task.operationState,
+			SyncPhase:   task.phase,
+		}
+		syncCtx.syncRes = map[string]synccommon.ResourceSyncResult{}
+		syncCtx.syncRes[task.resultKey()] = res
+
+		tasks, successful := syncCtx.getSyncTasks()
+
+		assert.True(t, successful)
+		assert.Len(t, tasks, 1)
+		assert.NotContains(t, tasks, task)
+	})
+}
+
+func TestNamespaceAutoCreationForNonExistingNs(t *testing.T) {
+	getResourceFunc := func(ctx context.Context, config *rest.Config, gvk schema.GroupVersionKind, name string, namespace string) (*unstructured.Unstructured, error) {
+		return nil, apierrors.NewNotFound(schema.GroupResource{}, FakeArgoCDNamespace)
+	}
+
+	pod := NewPod()
+	namespace := NewNamespace()
+	syncCtx := newTestSyncCtx(&getResourceFunc)
+	syncCtx.namespace = FakeArgoCDNamespace
+	namespace.SetName(FakeArgoCDNamespace)
+
+	t.Run("pre-sync task should exist and namespace creator should be called", func(t *testing.T) {
+		syncCtx.resources = groupResources(ReconciliationResult{
+			Live:   []*unstructured.Unstructured{nil},
+			Target: []*unstructured.Unstructured{pod},
+		})
+		creatorCalled := false
+		syncCtx.syncNamespace = func(m, l *unstructured.Unstructured) (bool, error) {
+			creatorCalled = true
+			return true, nil
+		}
+		tasks, successful := syncCtx.getSyncTasks()
+
+		assert.True(t, creatorCalled)
+		assert.True(t, successful)
+		assert.Len(t, tasks, 2)
+	})
+
+	t.Run("pre-sync task should be not created and namespace creator should be called", func(t *testing.T) {
+		syncCtx.resources = groupResources(ReconciliationResult{
+			Live:   []*unstructured.Unstructured{nil},
+			Target: []*unstructured.Unstructured{pod},
+		})
+		creatorCalled := false
+		syncCtx.syncNamespace = func(m, l *unstructured.Unstructured) (bool, error) {
+			creatorCalled = true
+			return false, nil
+		}
+		tasks, successful := syncCtx.getSyncTasks()
+
+		assert.True(t, creatorCalled)
+		assert.True(t, successful)
+		assert.Len(t, tasks, 1)
+	})
+
+	t.Run("pre-sync task error should be created if namespace creator has an error", func(t *testing.T) {
+		syncCtx.resources = groupResources(ReconciliationResult{
+			Live:   []*unstructured.Unstructured{nil},
+			Target: []*unstructured.Unstructured{pod},
+		})
+		creatorCalled := false
+		syncCtx.syncNamespace = func(m, l *unstructured.Unstructured) (bool, error) {
+			creatorCalled = true
+			return false, errors.New("some error")
+		}
+		tasks, successful := syncCtx.getSyncTasks()
+
+		assert.True(t, creatorCalled)
+		assert.True(t, successful)
+		assert.Len(t, tasks, 2)
+		assert.Equal(t, &syncTask{
+			phase:          synccommon.SyncPhasePreSync,
+			liveObj:        nil,
+			targetObj:      tasks[0].targetObj,
+			skipDryRun:     false,
+			syncStatus:     synccommon.ResultCodeSyncFailed,
+			operationState: synccommon.OperationError,
+			message:        "namespaceModifier error: some error",
+			waveOverride:   nil,
+		}, tasks[0])
+	})
 }
 
 func createNamespaceTask(namespace string) (*syncTask, error) {
@@ -802,7 +1142,7 @@ func createNamespaceTask(namespace string) (*syncTask, error) {
 }
 
 func TestSyncFailureHookWithSuccessfulSync(t *testing.T) {
-	syncCtx := newTestSyncCtx()
+	syncCtx := newTestSyncCtx(nil)
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{nil},
 		Target: []*unstructured.Unstructured{NewPod()},
@@ -817,7 +1157,7 @@ func TestSyncFailureHookWithSuccessfulSync(t *testing.T) {
 }
 
 func TestSyncFailureHookWithFailedSync(t *testing.T) {
-	syncCtx := newTestSyncCtx()
+	syncCtx := newTestSyncCtx(nil)
 	pod := NewPod()
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{nil},
@@ -828,7 +1168,10 @@ func TestSyncFailureHookWithFailedSync(t *testing.T) {
 		Commands: map[string]kubetest.KubectlOutput{pod.GetName(): {Err: fmt.Errorf("")}},
 	}
 	syncCtx.kubectl = mockKubectl
-	syncCtx.resourceOps = mockKubectl
+	mockResourceOps := kubetest.MockResourceOps{
+		Commands: map[string]kubetest.KubectlOutput{pod.GetName(): {Err: fmt.Errorf("")}},
+	}
+	syncCtx.resourceOps = &mockResourceOps
 
 	syncCtx.Sync()
 	syncCtx.Sync()
@@ -839,7 +1182,7 @@ func TestSyncFailureHookWithFailedSync(t *testing.T) {
 }
 
 func TestBeforeHookCreation(t *testing.T) {
-	syncCtx := newTestSyncCtx()
+	syncCtx := newTestSyncCtx(nil)
 	hook := Annotate(Annotate(NewPod(), synccommon.AnnotationKeyHook, "Sync"), synccommon.AnnotationKeyHookDeletePolicy, "BeforeHookCreation")
 	hook.SetNamespace(FakeArgoCDNamespace)
 	syncCtx.resources = groupResources(ReconciliationResult{
@@ -860,7 +1203,7 @@ func TestBeforeHookCreation(t *testing.T) {
 func TestRunSyncFailHooksFailed(t *testing.T) {
 	// Tests that other SyncFail Hooks run even if one of them fail.
 
-	syncCtx := newTestSyncCtx()
+	syncCtx := newTestSyncCtx(nil)
 	pod := NewPod()
 	successfulSyncFailHook := newHook(synccommon.HookTypeSyncFail)
 	successfulSyncFailHook.SetName("successful-sync-fail-hook")
@@ -880,7 +1223,14 @@ func TestRunSyncFailHooksFailed(t *testing.T) {
 			failedSyncFailHook.GetName(): {Err: fmt.Errorf("")}},
 	}
 	syncCtx.kubectl = mockKubectl
-	syncCtx.resourceOps = mockKubectl
+	mockResourceOps := kubetest.MockResourceOps{
+		Commands: map[string]kubetest.KubectlOutput{
+			// Fail operation
+			pod.GetName(): {Err: fmt.Errorf("")},
+			// Fail a single SyncFail hook
+			failedSyncFailHook.GetName(): {Err: fmt.Errorf("")}},
+	}
+	syncCtx.resourceOps = &mockResourceOps
 
 	syncCtx.Sync()
 	syncCtx.Sync()
@@ -916,7 +1266,7 @@ func TestRunSync_HooksNotDeletedIfPhaseNotCompleted(t *testing.T) {
 	inProgressHook.SetName("in-progress-hook")
 	_ = Annotate(inProgressHook, synccommon.AnnotationKeyHookDeletePolicy, "HookSucceeded")
 
-	syncCtx := newTestSyncCtx(
+	syncCtx := newTestSyncCtx(nil,
 		WithHealthOverride(resourceNameHealthOverride(map[string]health.HealthStatusCode{
 			inProgressHook.GetName(): health.HealthStatusProgressing,
 		})),
@@ -965,7 +1315,7 @@ func TestRunSync_HooksDeletedAfterPhaseCompleted(t *testing.T) {
 	completedHook2.SetName("completed-hook2")
 	_ = Annotate(completedHook2, synccommon.AnnotationKeyHookDeletePolicy, "HookSucceeded")
 
-	syncCtx := newTestSyncCtx(
+	syncCtx := newTestSyncCtx(nil,
 		WithInitialState(synccommon.OperationRunning, "", []synccommon.ResourceSyncResult{{
 			ResourceKey: kube.GetResourceKey(completedHook1),
 			HookPhase:   synccommon.OperationSucceeded,
@@ -1011,7 +1361,7 @@ func TestRunSync_HooksDeletedAfterPhaseCompletedFailed(t *testing.T) {
 	completedHook2.SetName("completed-hook2")
 	_ = Annotate(completedHook2, synccommon.AnnotationKeyHookDeletePolicy, "HookFailed")
 
-	syncCtx := newTestSyncCtx(
+	syncCtx := newTestSyncCtx(nil,
 		WithInitialState(synccommon.OperationRunning, "", []synccommon.ResourceSyncResult{{
 			ResourceKey: kube.GetResourceKey(completedHook1),
 			HookPhase:   synccommon.OperationSucceeded,
@@ -1124,7 +1474,7 @@ func Test_setRunningPhase_pendingDeletion(t *testing.T) {
 }
 
 func TestSyncWaveHook(t *testing.T) {
-	syncCtx := newTestSyncCtx(WithOperationSettings(false, false, false, false))
+	syncCtx := newTestSyncCtx(nil, WithOperationSettings(false, false, false, false))
 	pod1 := NewPod()
 	pod1.SetName("pod-1")
 	pod1.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "-1"})
@@ -1195,7 +1545,7 @@ func TestSyncWaveHook(t *testing.T) {
 }
 
 func TestSyncWaveHookFail(t *testing.T) {
-	syncCtx := newTestSyncCtx(WithOperationSettings(false, false, false, false))
+	syncCtx := newTestSyncCtx(nil, WithOperationSettings(false, false, false, false))
 	pod1 := NewPod()
 	pod1.SetName("pod-1")
 
@@ -1218,7 +1568,7 @@ func TestSyncWaveHookFail(t *testing.T) {
 }
 
 func TestPruneLast(t *testing.T) {
-	syncCtx := newTestSyncCtx()
+	syncCtx := newTestSyncCtx(nil)
 	syncCtx.pruneLast = true
 
 	pod1 := NewPod()

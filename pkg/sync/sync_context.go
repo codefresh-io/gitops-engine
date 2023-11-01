@@ -17,10 +17,12 @@ import (
 	apierr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2/klogr"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/util/openapi"
@@ -151,11 +153,13 @@ func WithResourceModificationChecker(enabled bool, diffResults *diff.DiffResultL
 	}
 }
 
-// WithNamespaceCreation will create non-exist namespace
-func WithNamespaceCreation(createNamespace bool, namespaceModifier func(*unstructured.Unstructured) bool) SyncOpt {
+// WithNamespaceModifier will create a namespace with the metadata passed in the `*unstructured.Unstructured` argument
+// of the `namespaceModifier` function, in the case it returns `true`. If the namespace already exists, the metadata
+// will overwrite what is already present if `namespaceModifier` returns `true`. If `namespaceModifier` returns `false`,
+// this will be a no-op.
+func WithNamespaceModifier(namespaceModifier func(*unstructured.Unstructured, *unstructured.Unstructured) (bool, error)) SyncOpt {
 	return func(ctx *syncContext) {
-		ctx.createNamespace = createNamespace
-		ctx.namespaceModifier = namespaceModifier
+		ctx.syncNamespace = namespaceModifier
 	}
 }
 
@@ -347,8 +351,9 @@ type syncContext struct {
 	// lock to protect concurrent updates of the result list
 	lock sync.Mutex
 
-	createNamespace   bool
-	namespaceModifier func(*unstructured.Unstructured) bool
+	// syncNamespace is a function that will determine if the managed
+	// namespace should be synced
+	syncNamespace func(*unstructured.Unstructured, *unstructured.Unstructured) (bool, error)
 
 	syncWaveHook common.SyncWaveHook
 
@@ -683,7 +688,7 @@ func (sc *syncContext) getSyncTasks() (_ syncTasks, successful bool) {
 		}
 	}
 
-	if sc.createNamespace && sc.namespace != "" {
+	if sc.syncNamespace != nil && sc.namespace != "" {
 		tasks = sc.autoCreateNamespace(tasks)
 	}
 
@@ -695,9 +700,31 @@ func (sc *syncContext) getSyncTasks() (_ syncTasks, successful bool) {
 		task.liveObj = sc.liveObj(task.targetObj)
 	}
 
+	isRetryable := func(err error) bool {
+		return apierr.IsUnauthorized(err)
+	}
+
+	serverResCache := make(map[schema.GroupVersionKind]*metav1.APIResource)
+
 	// check permissions
 	for _, task := range tasks {
-		serverRes, err := kube.ServerResourceForGroupVersionKind(sc.disco, task.groupVersionKind(), "get")
+
+		var serverRes *metav1.APIResource
+		var err error
+
+		if val, ok := serverResCache[task.groupVersionKind()]; ok {
+			serverRes = val
+			err = nil
+		} else {
+			err = retry.OnError(retry.DefaultRetry, isRetryable, func() error {
+				serverRes, err = kube.ServerResourceForGroupVersionKind(sc.disco, task.groupVersionKind(), "get")
+				return err
+			})
+			if serverRes != nil {
+				serverResCache[task.groupVersionKind()] = serverRes
+			}
+		}
+
 		if err != nil {
 			// Special case for custom resources: if CRD is not yet known by the K8s API server,
 			// and the CRD is part of this sync or the resource is annotated with SkipDryRunOnMissingResource=true,
@@ -776,32 +803,47 @@ func (sc *syncContext) autoCreateNamespace(tasks syncTasks) syncTasks {
 
 	if isNamespaceCreationNeeded {
 		nsSpec := &v1.Namespace{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: kube.NamespaceKind}, ObjectMeta: metav1.ObjectMeta{Name: sc.namespace}}
-		unstructuredObj, err := kube.ToUnstructured(nsSpec)
+		managedNs, err := kube.ToUnstructured(nsSpec)
 		if err == nil {
-			liveObj, err := sc.kubectl.GetResource(context.TODO(), sc.config, unstructuredObj.GroupVersionKind(), unstructuredObj.GetName(), metav1.NamespaceNone)
+			liveObj, err := sc.kubectl.GetResource(context.TODO(), sc.config, managedNs.GroupVersionKind(), managedNs.GetName(), metav1.NamespaceNone)
 			if err == nil {
-				nsTask := &syncTask{phase: common.SyncPhasePreSync, targetObj: unstructuredObj, liveObj: liveObj}
+				nsTask := &syncTask{phase: common.SyncPhasePreSync, targetObj: managedNs, liveObj: liveObj}
 				_, ok := sc.syncRes[nsTask.resultKey()]
 				if ok {
-					tasks = append(tasks, nsTask)
+					tasks = sc.appendNsTask(tasks, nsTask, managedNs, liveObj)
 				} else {
-					sc.log.WithValues("namespace", sc.namespace).Info("Namespace already exists")
-					liveObjCopy := liveObj.DeepCopy()
-					if sc.namespaceModifier(liveObjCopy) {
-						tasks = append(tasks, &syncTask{phase: common.SyncPhasePreSync, targetObj: liveObjCopy, liveObj: liveObj})
+					if liveObj != nil {
+						sc.log.WithValues("namespace", sc.namespace).Info("Namespace already exists")
+						tasks = sc.appendNsTask(tasks, &syncTask{phase: common.SyncPhasePreSync, targetObj: managedNs, liveObj: liveObj}, managedNs, liveObj)
 					}
 				}
 			} else if apierr.IsNotFound(err) {
-				tasks = append(tasks, &syncTask{phase: common.SyncPhasePreSync, targetObj: unstructuredObj, liveObj: nil})
+				tasks = sc.appendNsTask(tasks, &syncTask{phase: common.SyncPhasePreSync, targetObj: managedNs, liveObj: nil}, managedNs, nil)
 			} else {
-				task := &syncTask{phase: common.SyncPhasePreSync, targetObj: unstructuredObj}
-				sc.setResourceResult(task, common.ResultCodeSyncFailed, common.OperationError, fmt.Sprintf("Namespace auto creation failed: %s", err))
-				tasks = append(tasks, task)
+				tasks = sc.appendFailedNsTask(tasks, managedNs, fmt.Errorf("Namespace auto creation failed: %s", err))
 			}
 		} else {
 			sc.setOperationPhase(common.OperationFailed, fmt.Sprintf("Namespace auto creation failed: %s", err))
 		}
 	}
+	return tasks
+}
+
+func (sc *syncContext) appendNsTask(tasks syncTasks, preTask *syncTask, managedNs, liveNs *unstructured.Unstructured) syncTasks {
+	modified, err := sc.syncNamespace(managedNs, liveNs)
+	if err != nil {
+		tasks = sc.appendFailedNsTask(tasks, managedNs, fmt.Errorf("namespaceModifier error: %s", err))
+	} else if modified {
+		tasks = append(tasks, preTask)
+	}
+
+	return tasks
+}
+
+func (sc *syncContext) appendFailedNsTask(tasks syncTasks, unstructuredObj *unstructured.Unstructured, err error) syncTasks {
+	task := &syncTask{phase: common.SyncPhasePreSync, targetObj: unstructuredObj}
+	sc.setResourceResult(task, common.ResultCodeSyncFailed, common.OperationError, err.Error())
+	tasks = append(tasks, task)
 	return tasks
 }
 
@@ -861,20 +903,30 @@ func (sc *syncContext) ensureCRDReady(name string) error {
 	})
 }
 
-func (sc *syncContext) applyObject(t *syncTask, dryRun, force, validate bool) (common.ResultCode, string) {
-	dryRunStrategy := cmdutil.DryRunNone
-	if dryRun {
-		dryRunStrategy = cmdutil.DryRunClient
+func getDryRunStrategy(serverSideApply, dryRun bool) cmdutil.DryRunStrategy {
+	if !dryRun {
+		return cmdutil.DryRunNone
 	}
+	if serverSideApply {
+		return cmdutil.DryRunServer
+	}
+	return cmdutil.DryRunClient
+}
+
+func (sc *syncContext) applyObject(t *syncTask, dryRun, force, validate bool) (common.ResultCode, string) {
+	serverSideApply := sc.serverSideApply || resourceutil.HasAnnotationOption(t.targetObj, common.AnnotationSyncOptions, common.SyncOptionServerSideApply)
+
+	dryRunStrategy := getDryRunStrategy(serverSideApply, dryRun)
 
 	var err error
 	var message string
 	shouldReplace := sc.replace || resourceutil.HasAnnotationOption(t.targetObj, common.AnnotationSyncOptions, common.SyncOptionReplace)
-	serverSideApply := sc.serverSideApply || resourceutil.HasAnnotationOption(t.targetObj, common.AnnotationSyncOptions, common.SyncOptionServerSideApply)
 	if shouldReplace {
 		if t.liveObj != nil {
-			// Avoid using `kubectl replace` for CRDs since 'replace' might recreate resource and so delete all CRD instances
-			if kube.IsCRD(t.targetObj) {
+			// Avoid using `kubectl replace` for CRDs since 'replace' might recreate resource and so delete all CRD instances.
+			// The same thing applies for namespaces, which would delete the namespace as well as everything within it,
+			// so we want to avoid using `kubectl replace` in that case as well.
+			if kube.IsCRD(t.targetObj) || t.targetObj.GetKind() == kubeutil.NamespaceKind {
 				update := t.targetObj.DeepCopy()
 				update.SetResourceVersion(t.liveObj.GetResourceVersion())
 				_, err = sc.resourceOps.UpdateResource(context.TODO(), update, dryRunStrategy)

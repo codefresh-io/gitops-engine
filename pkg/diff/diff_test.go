@@ -3,16 +3,17 @@ package diff
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/argoproj/gitops-engine/pkg/diff/testdata"
-	"github.com/argoproj/gitops-engine/pkg/utils/kube/scheme"
+	openapi_v2 "github.com/google/gnostic/openapiv2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
@@ -20,7 +21,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/managedfields"
 	"k8s.io/klog/v2/klogr"
+	openapiproto "k8s.io/kube-openapi/pkg/util/proto"
 	"sigs.k8s.io/yaml"
 )
 
@@ -39,7 +43,7 @@ func printDiff(result *DiffResult) (string, error) {
 
 // printDiffInternal prints a diff between two unstructured objects using an external diff utility and returns the output.
 func printDiffInternal(name string, live *unstructured.Unstructured, target *unstructured.Unstructured) ([]byte, error) {
-	tempDir, err := ioutil.TempDir("", "argocd-diff")
+	tempDir, err := os.MkdirTemp("", "argocd-diff")
 	if err != nil {
 		return nil, err
 	}
@@ -51,7 +55,7 @@ func printDiffInternal(name string, live *unstructured.Unstructured, target *uns
 			return nil, err
 		}
 	}
-	err = ioutil.WriteFile(targetFile, targetData, 0644)
+	err = os.WriteFile(targetFile, targetData, 0644)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +67,7 @@ func printDiffInternal(name string, live *unstructured.Unstructured, target *uns
 			return nil, err
 		}
 	}
-	err = ioutil.WriteFile(liveFile, liveData, 0644)
+	err = os.WriteFile(liveFile, liveData, 0644)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +92,7 @@ func mustToUnstructured(obj interface{}) *unstructured.Unstructured {
 }
 
 func unmarshalFile(path string) *unstructured.Unstructured {
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		panic(err)
 	}
@@ -747,78 +751,139 @@ func TestUnsortedEndpoints(t *testing.T) {
 	}
 }
 
+func buildGVKParser(t *testing.T) *managedfields.GvkParser {
+	document := &openapi_v2.Document{}
+	err := proto.Unmarshal(testdata.OpenAPIV2Doc, document)
+	if err != nil {
+		t.Fatalf("error unmarshaling openapi doc: %s", err)
+	}
+	models, err := openapiproto.NewOpenAPIData(document)
+	if err != nil {
+		t.Fatalf("error building openapi data: %s", err)
+	}
+
+	gvkParser, err := managedfields.NewGVKParser(models, false)
+	if err != nil {
+		t.Fatalf("error building gvkParser: %s", err)
+	}
+	return gvkParser
+}
+
 func TestStructuredMergeDiff(t *testing.T) {
-	parser := scheme.StaticParser()
-	svcParseType := parser.Type("io.k8s.api.core.v1.Service")
-	manager := "argocd-controller"
+	buildParams := func(live, config *unstructured.Unstructured) *SMDParams {
+		gvkParser := buildGVKParser(t)
+		manager := "argocd-controller"
+		return &SMDParams{
+			config:    config,
+			live:      live,
+			gvkParser: gvkParser,
+			manager:   manager,
+		}
+	}
 
 	t.Run("will apply default values", func(t *testing.T) {
 		// given
+		t.Parallel()
 		liveState := StrToUnstructured(testdata.ServiceLiveYAML)
 		desiredState := StrToUnstructured(testdata.ServiceConfigYAML)
+		params := buildParams(liveState, desiredState)
 
 		// when
-		result, err := structuredMergeDiff(desiredState, liveState, &svcParseType, manager)
+		result, err := structuredMergeDiff(params)
 
 		// then
 		require.NoError(t, err)
 		assert.NotNil(t, result)
-		assert.False(t, result.Modified)
+		assert.True(t, result.Modified)
 		predictedSVC := YamlToSvc(t, result.PredictedLive)
 		liveSVC := YamlToSvc(t, result.NormalizedLive)
-		assert.NotNil(t, predictedSVC.Spec.InternalTrafficPolicy)
-		assert.NotNil(t, liveSVC.Spec.InternalTrafficPolicy)
+		require.NotNil(t, predictedSVC.Spec.InternalTrafficPolicy)
+		require.NotNil(t, liveSVC.Spec.InternalTrafficPolicy)
 		assert.Equal(t, "Cluster", string(*predictedSVC.Spec.InternalTrafficPolicy))
 		assert.Equal(t, "Cluster", string(*liveSVC.Spec.InternalTrafficPolicy))
+		assert.Empty(t, predictedSVC.Annotations[AnnotationLastAppliedConfig])
+		assert.Empty(t, liveSVC.Annotations[AnnotationLastAppliedConfig])
 	})
 	t.Run("will remove entries in list", func(t *testing.T) {
 		// given
+		t.Parallel()
 		liveState := StrToUnstructured(testdata.ServiceLiveYAML)
 		desiredState := StrToUnstructured(testdata.ServiceConfigWith2Ports)
-		expectedLiveState := StrToUnstructured(testdata.ExpectedServiceLiveWith2PortsYAML)
-		expectedLiveBytes, err := json.Marshal(expectedLiveState)
-		require.NoError(t, err)
+		params := buildParams(liveState, desiredState)
 
 		// when
-		result, err := structuredMergeDiff(desiredState, liveState, &svcParseType, manager)
-
-		// then
-		require.NoError(t, err)
-		assert.NotNil(t, result)
-		assert.True(t, result.Modified)
-		assert.Equal(t, string(expectedLiveBytes), string(result.PredictedLive))
-	})
-	t.Run("will remove previously added fields not present in desired state", func(t *testing.T) {
-		// given
-		liveState := StrToUnstructured(testdata.LiveServiceWithTypeYAML)
-		desiredState := StrToUnstructured(testdata.ServiceConfigYAML)
-		expectedLiveState := StrToUnstructured(testdata.ServiceLiveNoTypeYAML)
-		expectedLiveBytes, err := json.Marshal(expectedLiveState)
-		require.NoError(t, err)
-
-		// when
-		result, err := structuredMergeDiff(desiredState, liveState, &svcParseType, manager)
-
-		// then
-		require.NoError(t, err)
-		assert.NotNil(t, result)
-		assert.True(t, result.Modified)
-		assert.Equal(t, string(expectedLiveBytes), string(result.PredictedLive))
-	})
-	t.Run("will apply service with multiple ports", func(t *testing.T) {
-		// given
-		liveState := StrToUnstructured(testdata.ServiceLiveYAML)
-		desiredState := StrToUnstructured(testdata.ServiceConfigWithSamePortsYAML)
-
-		// when
-		result, err := structuredMergeDiff(desiredState, liveState, &svcParseType, manager)
+		result, err := structuredMergeDiff(params)
 
 		// then
 		require.NoError(t, err)
 		assert.NotNil(t, result)
 		assert.True(t, result.Modified)
 		svc := YamlToSvc(t, result.PredictedLive)
-		assert.Equal(t, 5, len(svc.Spec.Ports))
+		assert.Len(t, svc.Spec.Ports, 2)
+	})
+	t.Run("will remove previously added fields not present in desired state", func(t *testing.T) {
+		// given
+		t.Parallel()
+		liveState := StrToUnstructured(testdata.LiveServiceWithTypeYAML)
+		desiredState := StrToUnstructured(testdata.ServiceConfigYAML)
+		params := buildParams(liveState, desiredState)
+
+		// when
+		result, err := structuredMergeDiff(params)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.True(t, result.Modified)
+		svc := YamlToSvc(t, result.PredictedLive)
+		assert.Equal(t, corev1.ServiceTypeClusterIP, svc.Spec.Type)
+	})
+	t.Run("will apply service with multiple ports", func(t *testing.T) {
+		// given
+		t.Parallel()
+		liveState := StrToUnstructured(testdata.ServiceLiveYAML)
+		desiredState := StrToUnstructured(testdata.ServiceConfigWithSamePortsYAML)
+		params := buildParams(liveState, desiredState)
+
+		// when
+		result, err := structuredMergeDiff(params)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.True(t, result.Modified)
+		svc := YamlToSvc(t, result.PredictedLive)
+		assert.Len(t, svc.Spec.Ports, 5)
+	})
+	t.Run("will apply deployment defaults correctly", func(t *testing.T) {
+		// given
+		t.Parallel()
+		liveState := StrToUnstructured(testdata.DeploymentLiveYAML)
+		desiredState := StrToUnstructured(testdata.DeploymentConfigYAML)
+		params := buildParams(liveState, desiredState)
+
+		// when
+		result, err := structuredMergeDiff(params)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.False(t, result.Modified)
+		deploy := YamlToDeploy(t, result.PredictedLive)
+		assert.Len(t, deploy.Spec.Template.Spec.Containers, 1)
+		assert.Equal(t, "0", deploy.Spec.Template.Spec.Containers[0].Resources.Requests.Cpu().String())
+		assert.Equal(t, "0", deploy.Spec.Template.Spec.Containers[0].Resources.Requests.Memory().String())
+		assert.Equal(t, "0", deploy.Spec.Template.Spec.Containers[0].Resources.Requests.Storage().String())
+		assert.Equal(t, "0", deploy.Spec.Template.Spec.Containers[0].Resources.Limits.Cpu().String())
+		assert.Equal(t, "0", deploy.Spec.Template.Spec.Containers[0].Resources.Limits.Memory().String())
+		assert.Equal(t, "0", deploy.Spec.Template.Spec.Containers[0].Resources.Limits.Storage().String())
+		require.NotNil(t, deploy.Spec.Strategy.RollingUpdate)
+		expectedMaxSurge := &intstr.IntOrString{
+			Type:   intstr.String,
+			StrVal: "25%",
+		}
+		assert.Equal(t, expectedMaxSurge, deploy.Spec.Strategy.RollingUpdate.MaxSurge)
+		assert.Equal(t, "ClusterFirst", string(deploy.Spec.Template.Spec.DNSPolicy))
 	})
 }
 
@@ -1078,6 +1143,16 @@ func YamlToSvc(t *testing.T, y []byte) *corev1.Service {
 		t.Fatalf("error unmarshaling service bytes: %s", err)
 	}
 	return &svc
+}
+
+func YamlToDeploy(t *testing.T, y []byte) *appsv1.Deployment {
+	t.Helper()
+	deploy := appsv1.Deployment{}
+	err := yaml.Unmarshal(y, &deploy)
+	if err != nil {
+		t.Fatalf("error unmarshaling deployment bytes: %s", err)
+	}
+	return &deploy
 }
 
 func StrToUnstructured(yamlStr string) *unstructured.Unstructured {
