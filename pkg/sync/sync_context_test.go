@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"k8s.io/kubectl/pkg/cmd/util"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -84,6 +85,25 @@ func newTestSyncCtx(getResourceFunc *func(ctx context.Context, config *rest.Conf
 		opt(&sc)
 	}
 	return &sc
+}
+
+func TestGetDryRunStrategy(t *testing.T) {
+	t.Run("no dry run", func(t *testing.T) {
+		strategy := getDryRunStrategy(false, false)
+		assert.Equal(t, util.DryRunNone, strategy)
+	})
+	t.Run("no dry run with server side apply", func(t *testing.T) {
+		strategy := getDryRunStrategy(true, false)
+		assert.Equal(t, util.DryRunNone, strategy)
+	})
+	t.Run("dry run with server side apply", func(t *testing.T) {
+		strategy := getDryRunStrategy(true, true)
+		assert.Equal(t, util.DryRunServer, strategy)
+	})
+	t.Run("dry run with client side apply", func(t *testing.T) {
+		strategy := getDryRunStrategy(false, true)
+		assert.Equal(t, util.DryRunClient, strategy)
+	})
 }
 
 // make sure Validate means we don't validate
